@@ -6,9 +6,13 @@ import sqlite3
 import sys
 from collections import deque
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from hh import CheckError, HHClient, HHError, SEARCH_QUERIES, load_settings
+from common import CheckError
 from storage import DB_PATH, JobStore
+
+if TYPE_CHECKING:
+    from hh import HHClient
 
 
 @dataclass
@@ -21,7 +25,9 @@ class CollectionStats:
     limit_reached: bool = False
 
 
-def collect(store: JobStore, client: HHClient, limit: int, stats: CollectionStats) -> None:
+def collect(store: JobStore, client: "HHClient", limit: int, stats: CollectionStats) -> None:
+    from hh import HHError, SEARCH_QUERIES
+
     try:
         area_id = client.kazakhstan_id()
     except CheckError as exc:
@@ -108,6 +114,8 @@ def print_summary(stats: CollectionStats) -> None:
 
 
 def run_collect(limit: int) -> int:
+    from hh import HHClient, load_settings
+
     stats = CollectionStats()
     try:
         load_settings()
@@ -157,7 +165,7 @@ def show_job(store: JobStore, vacancy_id: str) -> int:
     print(f"Компания: {job['company'] or '(не указана)'}")
     print(f"Регион: {job['region'] or '(не указан)'}")
     print(f"Опыт: {job['experience_name'] or '(не указан)'}")
-    print(f"Статус: {job['status']}; опубликовано: {job['published_at']}")
+    print(f"Статус: {job['status']}; опубликовано: {job['published_at'] or '(не указано)'}")
     print(f"Впервые обнаружена: {job['first_seen_at']}")
     print(f"Последнее обнаружение: {job['last_seen_at']}")
     if job["salary_json"]:
@@ -192,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
             stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Личный AI Job Hunter: HH и SQLite.")
     commands = parser.add_subparsers(dest="command", required=True)
-    collect_parser = commands.add_parser("collect", help="Собрать вакансии за 30 дней")
+    collect_parser = commands.add_parser("collect", help="Необязательный источник: HH API за 30 дней")
     collect_parser.add_argument("--limit", type=positive_int, default=30)
     list_parser = commands.add_parser("list", help="Последние обнаруженные вакансии из SQLite")
     list_parser.add_argument("--limit", type=positive_int, default=20)

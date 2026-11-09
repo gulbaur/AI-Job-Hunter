@@ -5,12 +5,13 @@ import os
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
 import requests
 from dotenv import load_dotenv
+
+from common import CheckError, DescriptionParser, html_to_text
 
 ENV_PATH = Path(__file__).resolve().with_name(".env")
 HH_API = "https://api.hh.ru"
@@ -29,10 +30,6 @@ AUTH_HELP = (
     "При капче пройдите проверку в HH вручную и повторите запуск. "
     "Документация: https://github.com/hhru/api/blob/master/docs/authorization.md"
 )
-
-
-class CheckError(Exception):
-    """A diagnostic safe to print: no server bodies, secrets or raw exceptions."""
 
 
 class HHError(CheckError):
@@ -67,41 +64,6 @@ def find_kazakhstan_id(areas: Any) -> str:
             raise CheckError("HH API: некорректный список дочерних регионов.")
         pending.extend(children)
     raise CheckError("Казахстан не найден в справочнике регионов HH API.")
-
-
-class DescriptionParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
-        self.hidden = 0
-
-    def handle_data(self, data: str) -> None:
-        if not self.hidden:
-            self.parts.append(data)
-
-    def handle_starttag(self, tag: str, attrs: Any) -> None:
-        if tag in {"script", "style"}:
-            self.hidden += 1
-        elif not self.hidden and tag in {
-            "p", "br", "li", "div", "h1", "h2", "h3", "tr", "ul", "ol"
-        }:
-            self.parts.append("\n")
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in {"script", "style"}:
-            self.hidden = max(0, self.hidden - 1)
-        elif not self.hidden and tag in {
-            "p", "li", "div", "h1", "h2", "h3", "tr", "ul", "ol"
-        }:
-            self.parts.append("\n")
-
-
-def html_to_text(description: str) -> str:
-    parser = DescriptionParser()
-    parser.feed(description)
-    parser.close()
-    lines = (" ".join(line.split()) for line in "".join(parser.parts).splitlines())
-    return "\n".join(line for line in lines if line)
 
 
 def _error_codes(payload: Any) -> set[str]:

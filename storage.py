@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from hh import CheckError, html_to_text
+from common import CheckError, html_to_text
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "jobs.sqlite"
 
@@ -50,6 +50,10 @@ class JobStore:
         self.connection.row_factory = sqlite3.Row
         try:
             self.connection.executescript(SCHEMA)
+            columns={r[1] for r in self.connection.execute('PRAGMA table_info(jobs)')}
+            with self.connection:
+                for name in ('status_reason','location_requirements_json'):
+                    if name not in columns:self.connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} TEXT")
         except Exception:
             self.connection.close()
             raise
@@ -72,6 +76,9 @@ class JobStore:
         area = _optional_object(vacancy, "area")
         experience = _optional_object(vacancy, "experience")
         salary = vacancy.get("salary") or vacancy.get("salary_range")
+        locations=vacancy.get('applicant_locations')
+        if locations is not None and (not isinstance(locations,list) or not all(isinstance(v,str) for v in locations)):
+            raise CheckError('Некорректные требования к стране кандидата.')
         if salary is not None and not isinstance(salary, dict):
             raise CheckError("HH API: некорректные данные зарплаты.")
         timestamp = seen_at or datetime.now(timezone.utc).isoformat(timespec="microseconds")
@@ -83,6 +90,7 @@ class JobStore:
             experience.get("name"),
             json.dumps(salary, ensure_ascii=False) if salary is not None else None,
             vacancy["published_at"], timestamp, timestamp,
+            json.dumps(locations,ensure_ascii=False) if locations is not None else None,
         )
         with self.connection:
             # Serialize the existence check and upsert so concurrent runs count correctly.
@@ -94,8 +102,8 @@ class JobStore:
                 INSERT INTO jobs (
                     source, vacancy_id, title, company, region, region_id, url,
                     description_html, description_text, experience_id, experience_name,
-                    salary_json, published_at, first_seen_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    salary_json, published_at, first_seen_at, last_seen_at, location_requirements_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source, vacancy_id) DO UPDATE SET
                     title = excluded.title,
                     company = excluded.company,
@@ -108,7 +116,8 @@ class JobStore:
                     experience_name = excluded.experience_name,
                     salary_json = excluded.salary_json,
                     published_at = excluded.published_at,
-                    last_seen_at = MAX(jobs.last_seen_at, excluded.last_seen_at)
+                    last_seen_at = MAX(jobs.last_seen_at, excluded.last_seen_at),
+                    location_requirements_json=COALESCE(excluded.location_requirements_json,jobs.location_requirements_json)
             """, values)
         return existing is None
 

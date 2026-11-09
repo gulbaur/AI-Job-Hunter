@@ -1,0 +1,104 @@
+'use strict';
+let state=null,page='inbox',selected=null,filter='all',detailSignature='',listSignature='',attentionSignature='',excludedSignature='',dirty=false,loading=false,dialogMode=null,attempt=null;
+const $=id=>document.getElementById(id);
+const e=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const date=value=>value?new Date(value).toLocaleString('ru-RU',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit',timeZone:'Asia/Almaty'}):'Ещё не запускалась';
+const link=value=>{try{const u=new URL(value);return u.protocol==='https:'?u.href:'#';}catch{return '#';}};
+const lines=id=>$(id).value.split(/[\n;]+/).map(v=>v.trim()).filter(Boolean);
+const selectedJob=()=>state?.jobs.find(j=>j.key===selected);
+const visibleJobs=()=>state.jobs.filter(j=>filter==='all'||(filter==='new'?j.unread:!j.unread));
+function toast(message){$('toast').textContent=message;$('toast').classList.remove('hidden');clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('toast').classList.add('hidden'),5500);}
+async function post(action,data={}){const response=await fetch('/api/'+action,{method:'POST',headers:{'Content-Type':'application/json','X-Hunter-Token':state.csrf},body:JSON.stringify(data)});const result=await response.json();if(!response.ok)throw new Error(result.error||'Не удалось выполнить действие.');return result;}
+async function act(action,data={}){try{await post(action,data);await load();return true;}catch(err){toast(err.message);return false;}}
+async function load(){if(loading)return;loading=true;try{const response=await fetch('/api/state');const next=await response.json();if(!response.ok)throw new Error(next.error);const first=!state;state=next;if(!state.jobs.some(j=>j.key===selected)){selected=visibleJobs()[0]?.key||state.jobs[0]?.key||null;dirty=false;detailSignature='';}render();if(first)fillSettings();}catch(err){$('status').textContent='Нет связи с приложением. Открой run_hunter.cmd заново.';$('status-dot').className='live-dot error';}finally{loading=false;}}
+function badge(job){return `<span class="badge ${job.decision==='stretch'?'stretch':''}">${job.decision==='stretch'?'Есть пробелы':'Рассмотреть отклик'}</span>`;}
+function render(){
+  const busy=state.task.busy;
+  $('status').textContent=state.task.message;
+  $('status-dot').className='live-dot'+(state.task.error?' error':busy?' busy':'');
+  $('search').disabled=busy;$('search').textContent=busy?'Обрабатываю…':'⌕  Найти и подготовить';$('login').disabled=busy;
+  $('nav-count').textContent=state.jobs.length;$('new-count').textContent=state.jobs.filter(j=>j.unread).length;
+  $('deferred-count').textContent=state.jobs.filter(j=>!j.unread).length;
+  $('sent-count').textContent=state.history.filter(j=>['confirmed_by_site','already_applied_on_hh','reported_by_user'].includes(j.state)).length;
+  $('queue-count').textContent=state.jobs.length;$('last-check').textContent=date(state.coverage.finished_at);
+  renderList();renderDetail();renderHistory();renderCoverage();renderAttention();renderConfirmation();
+  document.querySelectorAll('[data-mutation]').forEach(b=>b.disabled=busy);
+  $('settings-form').querySelector('button[type=submit]').disabled=busy;
+  $('logs').textContent=state.logs.length?state.logs.join('\n'):(state.scheduled_log||'Журнал появится после запуска поиска.');
+}
+function renderAttention(){
+  const failures=state.failures||[];
+  $('attention-panel').classList.toggle('hidden',!failures.length);$('attention-count').textContent=failures.length;
+  const signature=JSON.stringify(failures);
+  if(signature!==attentionSignature){attentionSignature=signature;
+    $('attention-list').innerHTML=failures.map(j=>`<div class="history-item"><div><h3>${e(j.title)}</h3><p>${e(j.company||'')}</p><p>${e(j.error)}</p><a href="${e(link(j.url))}" target="_blank" rel="noopener noreferrer">Вакансия ↗</a></div><button class="secondary small-button" data-mutation data-retry="${e(j.key)}">Повторить подготовку</button></div>`).join('');
+    $('attention-list').querySelectorAll('[data-retry]').forEach(button=>button.onclick=async()=>{if(await saveLetter())await act('retry',{key:button.dataset.retry});});
+  }
+  const excluded=state.excluded||[];const excludedKey=JSON.stringify(excluded);
+  if(excludedKey!==excludedSignature){excludedSignature=excludedKey;
+    $('excluded-list').innerHTML=excluded.length?excluded.map(j=>`<div class="history-item"><div><h3>${e(j.title)}</h3><p>${e(j.company||'')}</p></div><button type="button" class="secondary small-button" data-mutation data-restore="${e(j.source+':'+j.vacancy_id)}">Вернуть в отбор</button></div>`).join(''):'<p class="muted">Исключённых вакансий нет.</p>';
+    $('excluded-list').querySelectorAll('[data-restore]').forEach(button=>button.onclick=async()=>{if(await act('restore',{key:button.dataset.restore}))toast('Вакансия возвращена в отбор. Текущие правила продолжают действовать.');});
+  }
+  const leads=state.leads||[];
+  $('manual-leads').innerHTML=leads.length?'<h3>Находки и ссылки для ручного просмотра</h3>'+leads.map(j=>`<p><a href="${e(link(j.url))}" target="_blank" rel="noopener noreferrer">${e(j.url)}</a><br><small>${e(j.note)}</small></p>`).join(''):'';
+}
+function renderList(){
+  const jobs=visibleJobs();const signature=JSON.stringify(jobs.map(j=>[j.key,j.unread,j.title,j.company,j.decision,j.region]))+selected+filter;
+  if(signature===listSignature)return;listSignature=signature;
+  $('job-list').innerHTML=jobs.length?jobs.map(j=>`<button class="job-card ${selected===j.key?'selected':''}" data-key="${e(j.key)}"><div class="company-line"><span class="company-logo">${e(j.company.slice(0,2).toUpperCase())}</span><span class="company-name">${e(j.company)}</span>${j.unread?'<span class="new-marker">НОВОЕ</span>':''}</div><div class="job-title">${e(j.title)}</div><div class="job-meta">${e(j.region||'Локация требует уточнения')}</div><div class="job-meta">${j.source==='hh'?'HeadHunter':'Сайт компании · вручную'}</div>${badge(j)}</button>`).join(''):`<div class="list-empty">${filter==='new'?'Новых непросмотренных писем нет.':filter==='deferred'?'Отложенных писем пока нет.':'Готовых писем пока нет.'}</div>`;
+  $('job-list').querySelectorAll('[data-key]').forEach(button=>button.addEventListener('click',async()=>{
+    if(dirty&&!await saveLetter())return;selected=button.dataset.key;detailSignature='';render();await act('view',{key:selected});
+  }));
+}
+function renderDetail(){
+  const j=selectedJob();const signature=j?JSON.stringify([j.key,j.summary,j.gaps,j.cv,j.letter,j.letter_mode,j.research]):'empty';
+  if(signature===detailSignature||dirty)return;detailSignature=signature;
+  if(!j){$('detail').innerHTML='<div class="empty"><span>✦</span><h2>Место для следующей возможности</h2><p>Нажми «Найти и подготовить». Программа сама соберёт вакансии, оценит их и подготовит письма.</p></div>';return;}
+  $('detail').innerHTML=`<div class="detail-top">${badge(j)}<a class="vacancy-link" href="${e(link(j.url))}" target="_blank" rel="noopener noreferrer">Открыть вакансию ↗</a></div><h2>${e(j.title)}</h2><div class="detail-company">${e(j.company)}<br>${e(j.region||'Локация требует уточнения')}</div><hr class="detail-rule"><div class="section-label"><span>✧</span> Почему эта вакансия</div><div class="summary-box">${e(j.summary||'Подробности оценки сохранены в пакете вакансии.')}</div>${j.gaps.length?`<details class="gaps"><summary>На что обратить внимание · ${j.gaps.length}</summary><ul>${j.gaps.map(g=>`<li>${e(g.reason||g.requirement||g)}</li>`).join('')}</ul></details>`:''}<div class="letter-heading"><div class="section-label"><span>✎</span> Твоё письмо</div><small>${j.letter_mode==='personalized'?'Индивидуальное · проверено по источникам':'Сохранённый черновик'}</small></div><textarea id="letter" aria-label="Сопроводительное письмо" spellcheck="true"></textarea><button id="save-letter" class="text-button" disabled>Изменений нет</button><button id="rewrite" class="secondary small-button" data-mutation>${j.letter_mode==='personalized'?'Новая версия письма':'Написать индивидуально'}</button>${researchBlock(j)}<div class="cv-row"><span>▤</span><div><b>${e(j.cv)}</b><small>${j.source==='hh'?'Рекомендованная версия. В HH используется резюме из аккаунта — его название покажем перед отправкой.':'Рекомендованный файл CV из папки profile. Загрузить его на внешний сайт нужно вручную.'}</small></div></div><div class="action-bar">${j.source==='hh'?'<button class="primary" id="prepare" data-mutation>Подготовить отправку →</button>':`<a class="primary" href="${e(link(j.url))}" target="_blank" rel="noopener noreferrer">Открыть сайт компании ↗</a>`}<button class="secondary" id="defer" data-mutation>Отложить</button><button class="reject" id="skip" data-mutation>Не подходит</button></div><p class="action-note">${j.source==='hh'?'Сначала проверка формы, затем отдельное подтверждение. Один отклик.':'Отправка на внешнем сайте выполняется вручную. Программа не заполняет эту форму.'}</p>${j.source!=='hh'?'<button class="text-button" id="manual-sent">Уже отправлено вручную — отметить в истории</button>':''}`;
+  $('letter').value=j.letter;
+  $('letter').addEventListener('input',()=>{dirty=$('letter').value!==j.letter;$('save-letter').disabled=!dirty;$('save-letter').textContent=dirty?'Сохранить изменения':'Изменений нет';});
+  $('save-letter').addEventListener('click',saveLetter);
+  $('rewrite')?.addEventListener('click',async()=>{if(await saveLetter())await act('rewrite',{key:selected});});
+  $('prepare')?.addEventListener('click',async()=>{if(await saveLetter())await act('prepare',{key:selected});});
+  $('defer').addEventListener('click',async()=>{if(!await saveLetter())return;const key=selected;const next=visibleJobs().find(job=>job.key!==key);if(await act('defer',{key})){selected=next?.key||null;detailSignature='';render();toast('Письмо отложено. Оно останется в списке.');}});
+  $('skip').addEventListener('click',async()=>{if(await act('skip',{key:selected}))toast('Вакансия исключена из готовых откликов.');});
+  $('manual-sent')?.addEventListener('click',()=>manualDialog(j));
+}
+function researchBlock(j){if(!j.research)return '';return `<details class="gaps"><summary>На чём основано письмо</summary><p>${e(j.research.note)}</p>${(j.research.sources||[]).map(source=>`<p><a href="${e(link(source.url))}" target="_blank" rel="noopener noreferrer">${e(source.title||source.url)} ↗</a><br><small>Проверено ${e(date(source.retrieved_at))}</small></p>`).join('')}</details>`;}
+async function saveLetter(){if(!dirty)return true;const text=$('letter').value;try{await post('letter',{key:selected,text});dirty=false;detailSignature='';await load();toast('Письмо сохранено');return true;}catch(err){toast(err.message);return false;}}
+const statuses={confirmed_by_site:'Доставка подтверждена сайтом',reported_by_user:'Отправлено вручную — по твоей отметке',already_applied_on_hh:'Ранее откликалась в HH',submitted_unverified:'Результат неизвестен — повтор заблокирован',submit_started:'Отправка начиналась — повтор заблокирован',hh_prepared:'Форма подготовлена',hh_form_closed:'Форма закрыта без отправки'};
+function renderHistory(){
+  const html=state.history.length?state.history.map(j=>`<div class="history-item"><div><h3>${e(j.title||'Отклик')}</h3><p>${e(j.company||'')}</p><a class="small" href="${e(link(j.target_url))}" target="_blank" rel="noopener noreferrer">Вакансия ↗</a></div><div class="history-state">${e(statuses[j.state]||j.state)}<small>${e(date(j.updated_at))}</small></div></div>`).join(''):'<p class="muted">Отправленных откликов пока нет. Подготовленные письма находятся на главной.</p>';
+  if($('history-list').innerHTML!==html)$('history-list').innerHTML=html;
+}
+function renderCoverage(){
+  const labels={checked:'проверено',limited:'достигнут лимит',partial:'проверено частично',error:'ошибка',fresh:'свежие результаты независимого веб-поиска',missing:'веб-поиск ещё не выполнен',stale:'веб-находки устарели',settings_changed:'настройки изменились — ожидаем новый веб-поиск',manual_link:'ссылка для ручного просмотра',needs_adapter:'описание пока не удалось прочитать',unavailable:'вакансия не найдена',duplicate_link:'повтор ссылки',hh_link:'обрабатывается через HH',incomplete_plan:'запросы поиска не совпадают с планом'};
+  const sources=state.coverage.sources||[];
+  $('coverage').innerHTML=sources.length?`<p>Проверка: ${e(date(state.coverage.finished_at))}. ${e(state.coverage.scope||'')}</p>`+sources.map(s=>`<div class="coverage-line"><b>${e(s.source)}</b> · ${e(labels[s.status]||s.status)}${s.seen!==undefined?' · карточек: '+e(s.seen):''}${s.saved!==undefined?' · новых: '+e(s.saved):''}${s.error?'<br>'+e(s.error):''}</div>`).join(''):'Отчёт появится после первого поиска.';
+}
+function setPage(next){page=next;document.querySelectorAll('.page').forEach(el=>el.classList.toggle('hidden',el.id!==page+'-page'));document.querySelectorAll('[data-page]').forEach(el=>el.classList.toggle('active',el.dataset.page===page));const titles={inbox:['Твои следующие возможности','Вакансии и письма в одном месте. Решение об отправке — за тобой.'],history:['Каждый шаг на своём месте','Отправленные отклики, подтверждения и результаты проверок.'],settings:['Настрой один раз — ищи по-своему','Все направления вместе. Меняй вакансии, источники и лимиты.']};$('page-title').textContent=titles[page][0];$('page-subtitle').textContent=titles[page][1];if(page==='settings')fillSettings();}
+function fillSettings(){if(!state)return;const s=state.settings;const vals={'custom-roles':s.custom_roles.join('\n'),'excluded-titles':s.excluded_title_words.join('\n'),'search-days':s.search_days,'letter-limit':s.vacancies_per_run,'scan-limit':s.scan_limit,'pages':s.pages_per_query,'budget':s.budget_usd??'','excluded-companies':(state.preferences?.excluded_companies||[]).join('\n'),'career-pages':state.sources.career_pages.join('\n'),'web-limit':state.sources.max_web_links};for(const [id,value]of Object.entries(vals))$(id).value=value;$('junior').checked=s.junior_experience;for(const src of ['hh','companies','web'])$('src-'+src).checked=state.sources.enabled.includes(src);$('boards').replaceChildren();for(const board of state.sources.boards)addBoard(board);}
+function addBoard(board={kind:'ashby',name:'',slug:''}){const div=document.createElement('div');div.className='board';div.innerHTML=`<div class="board-top"><select aria-label="Платформа доски">${['ashby','greenhouse','lever'].map(kind=>`<option ${kind===board.kind?'selected':''}>${kind}</option>`).join('')}</select><button type="button" aria-label="Удалить компанию">×</button></div><input class="board-name" aria-label="Название компании" placeholder="Название компании" value="${e(board.name)}" required><input class="board-slug" aria-label="Slug компании" placeholder="Slug, например company-name" value="${e(board.slug)}" required>`;div.querySelector('button').addEventListener('click',()=>div.remove());$('boards').append(div);}
+function openDialog(mode,html){dialogMode=mode;$('confirm-content').innerHTML=html;if(!$('confirm-dialog').open)$('confirm-dialog').showModal();}
+function closeDialog(){dialogMode=null;$('confirm-dialog').close();}
+function renderConfirmation(){
+  const c=state.confirmation;
+  if(!c){if(dialogMode==='hh'||dialogMode==='login')closeDialog();attempt=null;return;}
+  if(attempt===c.attempt)return;attempt=c.attempt;
+  if(c.login){openDialog('login','<div class="section-tag">ВХОД В HEADHUNTER</div><h2>Войди в открытом окне HH</h2><p>Логин и капчу пройди самостоятельно. Когда закончишь, возвращайся сюда.</p><div class="dialog-buttons"><button class="secondary" id="cancel-confirm">Закрыть</button><button class="primary" id="submit-confirm">Готово, вход выполнен</button></div>');$('cancel-confirm').onclick=()=>act('login-done',{attempt:c.attempt,cancel:true});$('submit-confirm').onclick=()=>act('login-done',{attempt:c.attempt});return;}
+  openDialog('hh',`<div class="section-tag">ОДИН ОТКЛИК В HH</div><h2>Проверила форму? Подтверди отправку</h2><p>В открытом окне HH проверь работодателя и письмо. После подтверждения программа нажмёт отправку один раз.</p><div class="notice"><b>Резюме в аккаунте HH:</b> ${e(c.review.hh_resume_title)}<br><a href="${e(link(c.review.vacancy_url))}" target="_blank" rel="noopener noreferrer">Проверить вакансию ↗</a></div><p>Будет отправлено резюме из аккаунта HH, включая сохранённые в нём контакты, и письмо из формы.</p><label>Для подтверждения введи:<br><code>${e(c.token)}</code><input id="confirmation-text" autocomplete="off" placeholder="Введи фразу полностью"></label><div class="dialog-error" id="confirmation-error"></div><div class="dialog-buttons"><button class="secondary" id="cancel-confirm">Отменить</button><button class="primary" id="submit-confirm" disabled>Отправить один отклик</button></div>`);
+  $('confirmation-text').addEventListener('input',()=>{$('submit-confirm').disabled=$('confirmation-text').value!==c.token;});
+  $('cancel-confirm').onclick=()=>act('confirm',{attempt:c.attempt,cancel:true});
+  $('submit-confirm').onclick=async()=>{try{$('submit-confirm').disabled=true;await post('confirm',{attempt:c.attempt,text:$('confirmation-text').value});closeDialog();await load();}catch(err){$('confirmation-error').textContent=err.message;$('submit-confirm').disabled=false;}};
+}
+function manualDialog(j){const token='ОТПРАВЛЕНО '+j.id;openDialog('manual',`<h2>Отклик уже отправлен вручную?</h2><p>Это твоя отметка в истории. Программа не проверяет доставку на внешнем сайте.</p><code>${e(token)}</code><input id="manual-text" aria-label="Подтверждение ручной отправки"><div class="dialog-buttons"><button class="secondary" id="manual-cancel">Отмена</button><button class="primary" id="manual-confirm" disabled>Отметить в истории</button></div>`);$('manual-cancel').onclick=closeDialog;$('manual-text').oninput=()=>{$('manual-confirm').disabled=$('manual-text').value!==token;};$('manual-confirm').onclick=async()=>{if(await act('manual-sent',{key:j.key,text:$('manual-text').value}))closeDialog();};}
+document.querySelectorAll('[data-page]').forEach(button=>button.addEventListener('click',()=>setPage(button.dataset.page)));
+document.querySelectorAll('[data-filter]').forEach(button=>button.addEventListener('click',()=>{filter=button.dataset.filter;document.querySelectorAll('[data-filter]').forEach(b=>b.classList.toggle('active',b===button));listSignature='';renderList();}));
+$('search').addEventListener('click',async()=>{if(await saveLetter()){setPage('inbox');await act('search');}});
+$('login').addEventListener('click',()=>act('login'));
+$('add-board').addEventListener('click',()=>addBoard());
+$('settings-form').addEventListener('submit',async event=>{event.preventDefault();const settings={...state.settings,role_groups:['junior','ml_ds','applied_ai'],custom_roles:lines('custom-roles'),excluded_title_words:lines('excluded-titles'),search_days:Number($('search-days').value),vacancies_per_run:Number($('letter-limit').value),scan_limit:Number($('scan-limit').value),pages_per_query:Number($('pages').value),budget_usd:$('budget').value.trim()===''?null:Number($('budget').value),junior_experience:$('junior').checked};const sources={...state.sources,enabled:['hh','companies','web'].filter(src=>$('src-'+src).checked),career_pages:lines('career-pages'),max_web_links:Number($('web-limit').value),boards:[...$('boards').children].map(div=>({kind:div.querySelector('select').value,name:div.querySelector('.board-name').value.trim(),slug:div.querySelector('.board-slug').value.trim()}))};if(await act('settings',{settings,sources,excluded_companies:lines('excluded-companies')}))toast('Настройки сохранены. Применятся при следующем поиске.');});
+$('confirm-dialog').addEventListener('cancel',event=>{event.preventDefault();if(dialogMode==='hh')act('confirm',{attempt,cancel:true});else if(dialogMode==='login')act('login-done',{attempt,cancel:true});else closeDialog();});
+$('shutdown').addEventListener('click',async()=>{if(state.task.busy){toast('Сначала дождись завершения текущего действия.');return;}if(dirty&&!await saveLetter())return;try{await post('shutdown');clearInterval(poll);$('status').textContent='Приложение закрыто. Чтобы вернуться, открой run_hunter.cmd.';$('search').disabled=true;toast('Работа завершена. Эту вкладку можно закрыть.');}catch(err){toast(err.message);}});
+window.addEventListener('beforeunload',event=>{if(dirty){event.preventDefault();event.returnValue='';}});
+load();const poll=setInterval(load,2500);

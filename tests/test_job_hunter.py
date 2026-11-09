@@ -83,7 +83,7 @@ class JobHunterTests(unittest.TestCase):
 
         with patch.object(requests.Session, "get", new=get), \
              patch.object(cli, "JobStore", side_effect=lambda: JobStore(self.db)), \
-             patch.object(cli, "load_settings"), \
+             patch.object(hh, "load_settings"), \
              patch.object(hh.time, "sleep"), \
              contextlib.redirect_stdout(self.output):
             return cli.run_collect(limit)
@@ -305,7 +305,7 @@ class JobHunterTests(unittest.TestCase):
         with JobStore(self.db) as store:
             store.save(vacancy())
         with patch.object(requests.Session, "request", side_effect=AssertionError("Network forbidden")), \
-             patch.object(cli, "load_settings", side_effect=AssertionError("Settings forbidden")), \
+             patch.object(hh, "load_settings", side_effect=AssertionError("Settings forbidden")), \
              patch.object(cli, "JobStore", side_effect=lambda: JobStore(self.db)), \
              contextlib.redirect_stdout(self.output):
             self.assertEqual(cli.main(["list", "--limit", "20"]), 0)
