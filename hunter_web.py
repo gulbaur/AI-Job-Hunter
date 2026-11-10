@@ -83,7 +83,7 @@ class App:
                     'letter_mode':packet.get('letter_mode','literal'),'research':packet.get('company_research')})
             store.connection.executescript(hh_response.SCHEMA)
             history=[dict(r) for r in store.connection.execute('''SELECT a.state,a.updated_at,a.target_url,
-                j.title,j.company FROM application_attempts a LEFT JOIN jobs j ON j.url=a.target_url
+                j.title,j.company,j.source,j.vacancy_id FROM application_attempts a LEFT JOIN jobs j ON j.url=a.target_url
                 ORDER BY a.updated_at DESC LIMIT 100''')]
             failures=work_queue.issues(store,load_preferences(self.root/'profile'),search_settings.load(self.root/'profile'),running=external_busy)
             excluded=[dict(r) for r in store.connection.execute("SELECT source,vacancy_id,title,company,status_reason FROM jobs WHERE status='skipped' ORDER BY last_seen_at DESC")]
@@ -113,14 +113,15 @@ class App:
         latest=max([last_run,last_scheduled,active],key=lambda v:(v.get('started_at') or v.get('finished_at',''),bool(v)))
         if not task['busy'] and external_busy:
             task.update(busy=True,kind='background',message='Программа выполняет обработку в другом окне или по расписанию…')
-        if not task['busy'] and latest.get('finished_at','')>=task.get('updated_at',''):
+        # An interrupted run has no finished_at; compare by the time it started so it is not hidden by an older UI action.
+        if not task['busy'] and (latest.get('finished_at') or latest.get('started_at') or '')>=task.get('updated_at',''):
             message=run_status.problem(latest)
             if message:task.update(error=True,message=message)
-            elif latest.get('state')=='started':task.update(error=True,message='Предыдущая подготовка прервалась. Неудачные этапы доступны для явного повтора.')
         if not task['busy'] and failures and not task['error']:
             task.update(error=True,message=f'Требуют внимания вакансии: {len(failures)}. Можно явно повторить подготовку ниже.')
-        if not task['busy'] and invocation.get('exit_code') not in (None,0,75) and invocation.get('invoked_at','')>max(latest.get('finished_at',''),task.get('updated_at','')):
-            task.update(error=True,message='Последний плановый запуск остановился. Подробности — в журнале ниже.')
+        if not task['busy'] and invocation.get('exit_code') not in (None,0) and invocation.get('invoked_at','')>max(latest.get('finished_at',''),task.get('updated_at','')):
+            task.update(error=True,message=run_status.WAIT_EXPIRED if invocation.get('exit_code')==75 else
+                        'Последний плановый запуск остановился. Подробности — в журнале ниже.')
         if not task['busy'] and report:
             from discovery import coverage_warnings
             warnings=coverage_warnings(report)
@@ -201,10 +202,23 @@ class App:
             answer=self.answer;self.confirmation=None
         return answer
 
+    def result_channel(self,review):
+        """After a click without visible HH confirmation: keep the browser open until the user has looked."""
+        with self.guard:
+            self.answer='';self.confirm_event.clear()
+            self.confirmation={'attempt':secrets.token_urlsafe(24),'review':review,'result':True}
+            self.task['message']='HH не показал подтверждение. Проверьте открытое окно HH и нажмите «Проверила».'
+        self.confirm_event.wait(600)
+        with self.guard:self.confirmation=None
+
     def confirm(self,data):
         with self.guard:
             c=self.confirmation
             if not c or data.get('attempt')!=c['attempt']:raise CheckError('Подтверждение устарело. Повторная отправка не запускается.')
+            if c.get('result'):
+                # Only acknowledges that the user looked; it never clicks anything on HH.
+                self.confirmation=None;self.task['message']='Проверяю результат на странице HH…';self.confirm_event.set()
+                return
             if data.get('cancel') is not True and data.get('text')!=c['token']:
                 raise CheckError('Введите фразу подтверждения точно как показано.')
             self.answer='' if data.get('cancel') is True else data['text']
@@ -219,11 +233,12 @@ class App:
                 if packet['source']!='hh':raise CheckError('На этом сайте отправка выполняется вручную.')
                 packet={**packet,'output_dir':str(self.root/'drafts/runs'/('web-'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')))}
                 state=hh_response.run(packet,store.connection,allow_send=True,
-                    profile_dir=self.root/'profile/hh_browser_check',confirmation_channel=self.confirm_channel)
+                    profile_dir=self.root/'profile/hh_browser_check',confirmation_channel=self.confirm_channel,
+                    result_channel=self.result_channel)
                 return {'confirmed_by_site':'HH подтвердил доставку отклика.',
                     'already_applied_on_hh':'На эту вакансию уже был отклик.',
                     'cancelled_before_send':'Отправка отменена. Письмо сохранено.',
-                    'submitted_unverified':'Отправка начиналась, результат неизвестен. Повтор заблокирован — проверьте HH.'}.get(state,state)
+                    'submitted_unverified':'Результат неизвестен. Проверьте отклики на HH и отметьте результат в «Истории».'}.get(state,state)
         self.start('hh',work)
 
     def login(self):
@@ -293,6 +308,20 @@ class App:
                         if attempt and attempt[0] not in {'hh_prepared','hh_form_closed'}:raise CheckError('Отправка уже начиналась; восстановление не разрешает повторный отклик.')
                         with store.connection:store.connection.execute("UPDATE jobs SET status='new',status_reason='restored_by_user' WHERE source=? AND vacancy_id=?",key)
                         work_queue.stage(store,tuple(key),'new')
+                        return
+                    if action=='resolve':
+                        # The user checked HH after an unknown result. Exact phrases; never a network action.
+                        store.connection.executescript(hh_response.SCHEMA)
+                        row=store.connection.execute('''SELECT a.state,j.source,j.vacancy_id FROM application_attempts a
+                            LEFT JOIN jobs j ON j.url=a.target_url WHERE a.target_url=?''',(str(data.get('url','')),)).fetchone()
+                        if not row or row[0] not in {'submitted_unverified','submit_started'} or row[1]!='hh':
+                            raise CheckError('Для этой записи отметка результата не требуется.')
+                        outcome={f'ОТКЛИК ЕСТЬ {row[2]}':'reported_by_user',f'ОТКЛИКА НЕТ {row[2]}':'hh_form_closed'}.get(data.get('text'))
+                        if not outcome:raise CheckError('Введите фразу точно как показано.')
+                        with store.connection:
+                            store.connection.execute('UPDATE application_attempts SET state=?,updated_at=? WHERE target_url=?',(outcome,stamp(),data['url']))
+                            if outcome=='reported_by_user':
+                                store.connection.execute("UPDATE jobs SET status='applied' WHERE source='hh' AND vacancy_id=?",(row[2],))
                         return
                     path,packet=self.packet(store,data.get('key'))
                     if action=='letter':

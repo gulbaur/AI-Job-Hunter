@@ -165,6 +165,83 @@ class WebTests(unittest.TestCase):
                 with self.assertRaises(CheckError):hh_response.run(packet,store.connection,allow_send=True,confirmation_channel=lambda review,token:token)
             browser.close()
 
+    def test_unconfirmed_send_keeps_browser_open_until_user_checked_then_rechecks(self):
+        # Audit A14: after a click without visible confirmation (captcha, slow HH) the window closed in 15 s.
+        from playwright.sync_api import sync_playwright
+        import contextlib
+        import hh_response
+        with sync_playwright() as p,self.app.store() as store:
+            packet=json.loads(self.path.read_text(encoding='utf-8'))
+            browser=p.chromium.launch(headless=True)
+            def context(*args,**kwargs):
+                ctx=browser.new_context()
+                def route(req):
+                    url=req.request.url
+                    if '/submit' in url:req.fulfill(body='ok');return
+                    if '/applicant/vacancy_response' in url:
+                        html='''<meta charset="utf-8"><form><div data-qa="resume-title">AI/ML Engineer</div>
+                        <textarea data-qa="vacancy-response-popup-form-letter-input"></textarea>
+                        <button data-qa="vacancy-response-submit-popup">Send</button></form><script>
+                        document.querySelector('form').onsubmit=async e=>{e.preventDefault();
+                        await fetch('/submit',{method:'POST',body:'x'});document.body.innerHTML='<div>Пройдите капчу</div>';
+                        setTimeout(()=>{document.body.innerHTML='<div>Резюме доставлено</div>';},700);};</script>'''
+                    else:html='<a data-qa="vacancy-response-link-top" href="/applicant/vacancy_response?vacancyId=1">Open</a>'
+                    req.fulfill(status=200,content_type='text/html',body=html)
+                ctx.route('**/*',route);return ctx
+            fake=Mock();fake.__enter__=Mock(return_value=fake);fake.__exit__=Mock(return_value=False)
+            fake.chromium.launch_persistent_context.side_effect=context
+            checked=Mock(side_effect=lambda review:time.sleep(1.2))
+            with patch('playwright.sync_api.sync_playwright',return_value=fake),patch('sys.stdin',None), \
+                 patch.object(hh_response,'SUCCESS_TIMEOUT_MS',200),contextlib.redirect_stdout(io.StringIO()):
+                state=hh_response.run(packet,store.connection,allow_send=True,
+                    confirmation_channel=lambda review,token:token,result_channel=checked)
+            browser.close()
+        checked.assert_called_once()
+        self.assertEqual(state,'confirmed_by_site')
+
+    def attempt(self,state):
+        import hh_response
+        with self.app.store() as store:
+            store.connection.executescript(hh_response.SCHEMA)
+            with store.connection:store.connection.execute('INSERT INTO application_attempts VALUES (?,?,?,?)',
+                ('https://hh.kz/vacancy/1','hash',state,'2026-11-09T10:00:00+00:00'))
+
+    def attempt_state(self):
+        with self.app.store() as store:
+            return store.connection.execute('SELECT state FROM application_attempts WHERE target_url=?',('https://hh.kz/vacancy/1',)).fetchone()[0]
+
+    def test_user_can_record_that_unverified_hh_response_was_not_sent(self):
+        self.attempt('submitted_unverified')
+        with self.assertRaises(CheckError):self.app.mutate('resolve',{'url':'https://hh.kz/vacancy/1','text':'да'})
+        self.app.mutate('resolve',{'url':'https://hh.kz/vacancy/1','text':'ОТКЛИКА НЕТ 1'})
+        self.assertEqual(self.attempt_state(),'hh_form_closed')
+        history=self.app.state()['history'][0]
+        self.assertEqual(history['vacancy_id'],'1')
+
+    def test_user_can_record_that_unverified_hh_response_was_delivered(self):
+        self.attempt('submit_started')
+        self.app.mutate('resolve',{'url':'https://hh.kz/vacancy/1','text':'ОТКЛИК ЕСТЬ 1'})
+        self.assertEqual(self.attempt_state(),'reported_by_user')
+        with self.app.store() as store:self.assertEqual(store.get('1')['status'],'applied')
+
+    def test_confirmed_attempt_cannot_be_reopened_by_user_mark(self):
+        self.attempt('confirmed_by_site')
+        with self.assertRaises(CheckError):self.app.mutate('resolve',{'url':'https://hh.kz/vacancy/1','text':'ОТКЛИКА НЕТ 1'})
+        self.assertEqual(self.attempt_state(),'confirmed_by_site')
+
+    def test_result_check_dialog_waits_for_user_and_is_single_use(self):
+        done=[]
+        thread=threading.Thread(target=lambda:done.append(self.app.result_channel({'hh_resume_title':'AI Engineer'})))
+        thread.start()
+        for _ in range(200):
+            if self.app.confirmation:break
+            time.sleep(.005)
+        c=self.app.state()['confirmation'];self.assertTrue(c['result'])
+        self.assertEqual(done,[])
+        self.app.confirm({'attempt':c['attempt'],'checked':True})
+        thread.join(2);self.assertEqual(done,[None])
+        with self.assertRaises(CheckError):self.app.confirm({'attempt':c['attempt'],'checked':True})
+
     def test_failed_preparation_ui_retries_only_selected_job_without_send(self):
         import work_queue
         from playwright.sync_api import sync_playwright

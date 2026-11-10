@@ -224,7 +224,7 @@ def coverage_report():
     report=json.loads(discovery.REPORT.read_text(encoding='utf-8'))
     print('\nОХВАТ ПОИСКА / '+report['started_at'])
     print(report['scope'])
-    labels={'checked':'проверено','limited':'достигнут лимит','partial':'частично','error':'ошибка',
+    labels={'checked':'проверено','limited':'достигнут лимит','partial':'частично','failed':'не работает','error':'ошибка',
             'fresh':'свежий поиск','missing':'веб-поиск ещё не выполнен','stale':'веб-поиск устарел',
             'settings_changed':'правила изменились, нужен новый веб-поиск','invalid_input':'ошибка данных веб-поиска',
             'incomplete_plan':'список выполненных запросов не совпадает с планом',

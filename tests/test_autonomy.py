@@ -25,6 +25,12 @@ def response(content=None,annotations=None,searches=1):
     return r
 
 
+def error_response(status,message):
+    r=requests.Response();r.status_code=status;r._content_consumed=True
+    r._content=json.dumps({'error':{'message':message,'code':status}}).encode()
+    return r
+
+
 RESEARCH={'status':'vacancy_only','sources':[],'fragments':{},'company':'Example','note':'По задачам вакансии.',
           'retrieved_at':'2026-10-23T13:00:00+00:00'}
 DRAFT={'cv_variant':'ml_engineer','fact_ids':['ML001','ML002'],
@@ -33,6 +39,12 @@ DRAFT={'cv_variant':'ml_engineer','fact_ids':['ML001','ML002'],
     'experience':[{'text':'В работе я оценивала модели классификации изображений с учётом качества разметки и участвовала в развёртывании инференса PyTorch в сервис.',
                    'fact_ids':['ML001','ML002']}],
     'closing':'Буду рада обсудить задачи команды и подробнее рассказать о своём опыте.'}
+
+
+AUDIT_OK={'findings':[]}
+# Quote really present in DRAFT and judged unsupported: a genuine grounding failure.
+AUDIT_BAD={'findings':[{'quote':'участвовала в развёртывании инференса PyTorch в сервис','verdict':'unsupported',
+    'explanation':'Недоказанный опыт.'}]}
 
 
 class AutonomyTests(unittest.TestCase):
@@ -62,13 +74,48 @@ class AutonomyTests(unittest.TestCase):
             report=web_search.refresh({},self.root/'web.json',session=session,key='fixture',model='test')
         self.assertEqual([q['status'] for q in report['queries']],['error','ok'])
 
+    def test_web_search_does_not_force_tool_choice_that_cheap_providers_reject(self):
+        # 05.11.2026+: 'required' left zero endpoints under PRICE_CAP -> HTTP 404 on every query.
+        session=Mock();session.post.return_value=response()
+        web_search.search_query('q',session=session,key='fixture',model='test')
+        self.assertIn(session.post.call_args.kwargs['json'].get('tool_choice'),(None,'auto'))
+
+    def test_web_search_error_keeps_provider_message_without_secrets(self):
+        session=Mock();session.post.return_value=error_response(404,"No endpoints found that support the provided 'tool_choice' value.")
+        with self.assertRaises(CheckError) as caught:
+            web_search.search_query('q',session=session,key='secret-key-value',model='test')
+        self.assertIn('HTTP 404',str(caught.exception));self.assertIn('tool_choice',str(caught.exception))
+        self.assertNotIn('secret-key-value',str(caught.exception))
+
+    def test_model_request_error_keeps_provider_message(self):
+        import model_api
+        session=Mock();session.post.return_value=error_response(402,'Insufficient credits')
+        with self.assertRaises(model_api.ModelUnavailable) as caught:
+            model_api.request_json(session,{},'fixture',lambda raw:raw)
+        self.assertIn('HTTP 402',str(caught.exception));self.assertIn('Insufficient credits',str(caught.exception))
+
+    def test_web_refresh_stops_series_after_configuration_error(self):
+        session=Mock();session.post.return_value=error_response(404,'No endpoints found')
+        with patch.object(web_search.sources,'web_plan',return_value=['q1','q2','q3']), \
+             contextlib.redirect_stdout(io.StringIO()):
+            report=web_search.refresh({},self.root/'web.json',session=session,key='fixture',model='test')
+        self.assertEqual(session.post.call_count,1)
+        self.assertEqual([q['status'] for q in report['queries']],['error','skipped','skipped'])
+
+    def test_web_refresh_continues_after_transient_error(self):
+        session=Mock();session.post.side_effect=[error_response(429,'Rate limited'),response()]
+        with patch.object(web_search.sources,'web_plan',return_value=['q1','q2']), \
+             contextlib.redirect_stdout(io.StringIO()):
+            report=web_search.refresh({},self.root/'web.json',session=session,key='fixture',model='test')
+        self.assertEqual([q['status'] for q in report['queries']],['error','ok'])
+
     def make(self,session,job=None):
         with patch('company_research.research',return_value=RESEARCH),contextlib.redirect_stdout(io.StringIO()):
             return personalized.prepare_letter(job or JOB,PROFILES,ASSESSMENT,'test',profile_dir=self.root/'profile',
                 output_dir=self.root/'drafts',run=True,budget=1,key='fixture',session=session)
 
     def test_personal_letter_paraphrases_supported_experience_and_preserves_user_edit(self):
-        session=Mock();session.post.side_effect=[response(DRAFT),response({'valid':True,'issues':[]})]
+        session=Mock();session.post.side_effect=[response(DRAFT),response(AUDIT_OK)]
         folder=self.make(session)
         text=(folder/'letter.txt').read_text(encoding='utf-8')
         self.assertIn(DRAFT['opening']['text'],text)
@@ -91,13 +138,71 @@ class AutonomyTests(unittest.TestCase):
             with self.subTest(kind=kind),self.assertRaises(CheckError):personalized.validate(draft,catalogs,{'J001':'Обучать модели.'},{})
 
     def test_grounding_failure_is_recorded_without_automatic_paid_retry(self):
-        session=Mock();session.post.side_effect=[response(DRAFT),response({'valid':False,'issues':['Недоказанный опыт.']})]
+        session=Mock();session.post.side_effect=[response(DRAFT),response(AUDIT_BAD)]
         with self.assertRaises(CheckError):self.make(session)
         with self.assertRaises(CheckError):self.make(session)
         self.assertEqual(session.post.call_count,2)
         self.assertEqual(list(self.root.rglob('letter.txt')),[])
         record=json.loads(next(self.root.rglob('personalized.json')).read_text(encoding='utf-8'))
         self.assertEqual(record['status'],'rejected')
+
+    def last_record(self):
+        return json.loads(max(self.root.rglob('personalized.json'),key=lambda p:p.stat().st_mtime).read_text(encoding='utf-8'))
+
+    def test_audit_comments_confirming_claims_do_not_reject_letter(self):
+        # Kolesa 139110453 / Platvix: the auditor listed only confirmations, the old rule rejected anyway.
+        audit={'findings':[{'quote':'оценивала модели классификации изображений с учётом качества разметки','verdict':'supported',
+            'explanation':'Соответствует ML001, допустимое обобщение.'}]}
+        session=Mock();session.post.side_effect=[response(DRAFT),response(audit)]
+        folder=self.make(session)
+        self.assertTrue((folder/'letter.txt').exists())
+        self.assertEqual(self.last_record()['status'],'valid')
+
+    def test_unsupported_claim_quoted_from_letter_rejects_it(self):
+        session=Mock();session.post.side_effect=[response(DRAFT),response(AUDIT_BAD)]
+        with self.assertRaises(CheckError) as caught:self.make(session)
+        self.assertIn('участвовала в развёртывании инференса PyTorch',str(caught.exception))
+        record=self.last_record()
+        self.assertEqual(record['status'],'rejected');self.assertEqual(record['audit_model'],personalized.AUDIT_MODEL)
+
+    def test_auditor_finding_about_text_absent_from_letter_is_ignored_and_kept(self):
+        # Kaspi 138894205: the auditor complained about a "UNIX projects" paragraph the letter does not contain.
+        audit={'findings':[{'quote':'в абзаце про UNIX-подобные проекты','verdict':'unsupported','explanation':'Нет в CV.'}]}
+        session=Mock();session.post.side_effect=[response(DRAFT),response(audit)]
+        self.make(session)
+        record=self.last_record()
+        self.assertEqual(record['status'],'valid');self.assertEqual(len(record['ignored_findings']),1)
+
+    def test_letter_uses_cv_variant_chosen_by_assessment(self):
+        session=Mock();session.post.side_effect=[response({**DRAFT,'cv_variant':'applied_ai','fact_ids':['AI001','AI002'],
+            'experience':[{**DRAFT['experience'][0],'fact_ids':['AI001','AI002']}]}),response(AUDIT_OK)]
+        job={**JOB,'title':'ML Engineer','description_text':'Разрабатывать RAG и LLM-сервисы.'}
+        assessment={**ASSESSMENT,'cv_variant':'applied_ai','matches':[{'requirement_quote':'RAG','cv_quote':'RAG-поиск','reason':'Есть RAG.'}]}
+        with patch('company_research.research',return_value=RESEARCH),contextlib.redirect_stdout(io.StringIO()):
+            personalized.prepare_letter(job,PROFILES,assessment,'test',profile_dir=self.root/'profile',
+                output_dir=self.root/'drafts',run=True,budget=1,key='fixture',session=session)
+        sent=json.loads(session.post.call_args_list[0].kwargs['json']['messages'][1]['content'])
+        self.assertEqual(list(sent['cv_facts']),['applied_ai'])
+        self.assertEqual(sent['assessment']['matches'][0]['reason'],'Есть RAG.')
+
+    def test_data_scientist_vacancy_about_rag_keeps_rag_facts(self):
+        # Parametric 138879721: title "Data Scientist", tasks about RAG/LLM agents.
+        job={**JOB,'title':'Data Scientist','description_text':'Внедрение RAG по корпоративным документам и интеграции LLM.'}
+        catalogs={'applied_ai':{'AI001':'Дорабатывала RAG-поиск по документации с индексами SQLite.',
+            'AI002':'Дообучала модель на собранном датасете.','AI003':'Оценивала качество моделей PyTorch.'}}
+        self.assertIn('AI001',__import__('prepare').relevant_facts(job,catalogs)['applied_ai'])
+        classic={**job,'description_text':'Строить модели прогнозирования спроса на табличных данных.'}
+        self.assertNotIn('AI001',__import__('prepare').relevant_facts(classic,catalogs)['applied_ai'])
+
+    def test_audit_outage_reuses_paid_draft_on_explicit_retry(self):
+        session=Mock();session.post.side_effect=[response(DRAFT),error_response(503,'Provider unavailable')]
+        with self.assertRaises(CheckError):self.make(session,{**JOB,'_letter_revision':'first'})
+        with self.assertRaises(CheckError) as caught:self.make(session,{**JOB,'_letter_revision':'first'})
+        self.assertNotIn('отклон',str(caught.exception));self.assertIn('из-за сбоя',str(caught.exception))
+        session.post.side_effect=[response(AUDIT_OK)]
+        folder=self.make(session,{**JOB,'_letter_revision':'second'})
+        self.assertEqual(session.post.call_count,3)  # draft + failed audit + one new audit, no new draft
+        self.assertIn(DRAFT['opening']['text'],(folder/'letter.txt').read_text(encoding='utf-8'))
 
     def test_preview_never_researches_company_or_calls_model(self):
         session=Mock()
@@ -112,8 +217,8 @@ class AutonomyTests(unittest.TestCase):
         self.assertTrue(company_research.first_party('https://acme.com/about','Acme'))
 
     def test_explicit_new_revision_preserves_old_user_edited_file(self):
-        session=Mock();session.post.side_effect=[response(DRAFT),response({'valid':True,'issues':[]}),
-            response(DRAFT),response({'valid':True,'issues':[]})]
+        session=Mock();session.post.side_effect=[response(DRAFT),response(AUDIT_OK),
+            response(DRAFT),response(AUDIT_OK)]
         first=self.make(session,{**JOB,'_letter_revision':'first'})
         (first/'letter.txt').write_text('Моя редакция',encoding='utf-8')
         second=self.make(session,{**JOB,'_letter_revision':'second'})

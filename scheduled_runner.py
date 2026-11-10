@@ -44,7 +44,10 @@ def main():
     try:notice=json.loads(notice_path.read_text(encoding='utf-8'))
     except (OSError,ValueError):pass
     problem_state=state
-    if code not in (0,75) and not run_status.problem(state):
+    if code==75:
+        # 121 attempts over an hour: the window was never processed. Not an error of the run, but the user must know.
+        problem_state={'state':'stopped','error':run_status.WAIT_EXPIRED,'invoked_at':datetime.now(timezone.utc).isoformat()}
+    elif code!=0 and not run_status.problem(state):
         problem_state={'state':'stopped','error':'Не удалось запустить плановую подготовку. Подробности — в журнале приложения.'}
     signature=run_status.fingerprint(problem_state)
     new_problem=bool(signature and signature!=notice.get('last_failure'))

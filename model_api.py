@@ -5,7 +5,7 @@ import math
 
 import requests
 
-from common import CheckError
+from common import CheckError, http_error_text
 
 
 class RejectedOutput(CheckError):
@@ -28,7 +28,7 @@ def request_json(session, payload: dict, key: str, validator) -> tuple[dict, dic
         raise ModelUnavailable("Запрос OpenRouter не завершён; повтор доступен по вашему действию.") from None
     with response:
         if response.status_code != 200:
-            raise ModelUnavailable(f"OpenRouter: HTTP {response.status_code}; запрос остановлен.")
+            raise ModelUnavailable(http_error_text("OpenRouter", response)[:-1] + "; запрос остановлен.")
         try:
             body = response.json()
         except ValueError:

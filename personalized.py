@@ -43,13 +43,21 @@ AUDIT_PROMPT='''Проверь сопроводительное письмо п�
 Допускаются осторожные переформулировки и профессиональный интерес к задачам вакансии.
 Утверждения о компании должны следовать из company sources; без них разрешены только задачи вакансии.
 Личная история, «давно мечтал(а)», «слежу за компанией», выдуманные ценности запрещены.
-Если есть хоть одно неподтверждённое утверждение, valid=false и конкретные issues. Не исправляй текст.
-JSON: {valid:boolean, issues:string[]}.'''
+Не исправляй текст. Верни JSON {findings:[{quote, explanation, verdict}]}:
+quote — дословная цитата утверждения из письма (скопируй 5–25 слов без изменений);
+verdict — unsupported (не следует из источников), overstated (преувеличивает участие, результат
+или ответственность) или supported (подтверждено); explanation — коротко, со ссылкой на ID источника.
+Включай в findings прежде всего unsupported и overstated. Если ошибок нет, верни пустой findings.'''
 AUDIT_PROMPT+='''
 Не требуй дословного совпадения: естественное сокращение, перефразирование и опущение несущественных
 деталей допустимы. «API сервиса» для отдельных эндпоинтов и «подключение моделей» для адаптера
 к API модели — допустимые обобщения, если не добавляют результатов или ответственности.
-Не включай подтверждённые утверждения в issues и не объявляй пропуск детали ложным фактом.
+Не помечай подтверждённые утверждения как unsupported и не объявляй пропуск детали ложным фактом.
+Не жалуйся на то, чего в письме нет: каждая находка должна цитировать текст письма.
+Проверяй истинность по всем cv_facts выбранного CV: если утверждение следует из любого факта,
+verdict=supported, даже если fact_ids абзаца указаны неточно. Неточная ссылка — не фактическая ошибка.
+Сначала напиши explanation, затем выбери verdict, который ему соответствует: если в explanation
+сказано, что ошибки нет, verdict только supported.
 Реальная ошибка: «самостоятельно разработал(а) все интеграции», если самостоятельность подтверждена
 только для одной части системы. Допустимо: «разрабатывал(а) эндпоинты, работал(а) над интеграциями».
 Перечисляй только существенные фактические ошибки, а не стилистические предпочтения.'''
@@ -99,6 +107,49 @@ def validate(draft,catalogs,jobs,companies):
     return draft
 
 
+AUDIT_SCHEMA=assess.object_schema({'findings':{'type':'array','maxItems':8,'items':assess.object_schema({
+    'quote':{'type':'string','minLength':3,'maxLength':300},
+    # Explanation precedes the verdict so the model reasons before deciding (Kaspi 09.11: verdict contradicted its reason).
+    'explanation':{'type':'string','maxLength':500},
+    'verdict':{'type':'string','enum':['unsupported','overstated','supported']}})}})
+
+
+def _normal(text):
+    text=str(text).casefold().replace('ё','е')
+    return ' '.join(re.sub(r'[«»"“”„\'`.,;:!?()—–-]',' ',text).split())
+
+
+def quoted_in_letter(quote,letter):
+    """The auditor must point at real letter text; small punctuation/case drift is tolerated."""
+    quote,letter=_normal(quote),_normal(letter)
+    if not quote:return False
+    if quote in letter:return True
+    words,size=letter.split(),len(quote.split())
+    return any(SequenceMatcher(None,quote,' '.join(words[i:i+size])).ratio()>=.85 for i in range(max(1,len(words)-size+1)))
+
+
+def audit_verdict(raw,letter):
+    """Reject only for unsupported/overstated findings that quote the letter; return the others for review."""
+    assess.validate_schema(raw,AUDIT_SCHEMA)
+    problems=[f for f in raw['findings'] if f['verdict']!='supported']
+    confirmed=[f for f in problems if quoted_in_letter(f['quote'],letter)]
+    ignored=[f for f in problems if f not in confirmed]
+    if confirmed:
+        raise CheckError('Проверка фактов письма не пройдена: '+'; '.join(f"«{f['quote']}» — {f['explanation']}" for f in confirmed))
+    return ignored
+
+
+def failed_draft(output_dir,job,base_identity):
+    """A paid draft whose audit did not run (service outage); it can be re-audited without a new draft."""
+    folder=Path(output_dir)/f"{job['source']}-{job['vacancy_id']}"
+    for path in sorted(folder.glob('personal-*/personalized.json'),key=lambda p:p.stat().st_mtime,reverse=True):
+        try:record=json.loads(path.read_text(encoding='utf-8'))
+        except (OSError,ValueError):continue
+        if record.get('status')=='failed' and record.get('base_identity')==base_identity and isinstance(record.get('draft'),dict):
+            return path.parent.name,record
+    return None
+
+
 def previous_letters(output):
     result=[]
     for path in sorted(Path(output).glob('*/personal-*/personalized.json'),reverse=True):
@@ -121,7 +172,8 @@ def prepare_letter(job,profiles,assessment,model,*,profile_dir,output_dir,run,bu
     if preferences and location_fit(job,preferences)[0] in {'blocked','unconfirmed'}:raise CheckError('География вакансии не подходит.')
     language=job.get('_letter_language','ru')
     catalogs=prepare.fact_catalog(profiles,language)
-    routed=prepare.route_cv(job['title'],None)
+    # The assessment already chose the CV that fits the whole vacancy; the title is only a fallback.
+    routed=assessment.get('cv_variant') if assessment.get('cv_variant') in catalogs else prepare.route_cv(job['title'],None)
     if routed:catalogs={routed:catalogs[routed]}
     catalogs=prepare.relevant_facts(job,catalogs)
     # These optional facts are explicitly confirmed by the user, not inferred from CV.
@@ -139,8 +191,10 @@ def prepare_letter(job,profiles,assessment,model,*,profile_dir,output_dir,run,bu
         jobs=dict(list(assess.fragments(job['description_text'],'J').items())[:90])
         companies={k:v['text'] for k,v in company['fragments'].items()}
         audit_model=os.getenv('OPENROUTER_AUDIT_MODEL',AUDIT_MODEL).strip() or AUDIT_MODEL
-        identity=hashlib.sha256(json.dumps({'version':VERSION,'model':model,'job':{k:job.get(k) for k in assess.JOB_FIELDS},
-            'catalogs':catalogs,'company':companies,'language':language,'audit_model':audit_model,'revision':job.get('_letter_revision')},ensure_ascii=False,sort_keys=True).encode()).hexdigest()
+        basis={'version':VERSION,'model':model,'job':{k:job.get(k) for k in assess.JOB_FIELDS},
+            'catalogs':catalogs,'company':companies,'language':language,'audit_model':audit_model}
+        base_identity=hashlib.sha256(json.dumps(basis,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
+        identity=hashlib.sha256(json.dumps({**basis,'revision':job.get('_letter_revision')},ensure_ascii=False,sort_keys=True).encode()).hexdigest()
         folder=Path(output_dir)/f"{job['source']}-{job['vacancy_id']}"/('personal-'+identity[:16])
         cache=folder/'personalized.json'
         if cache.exists():
@@ -148,37 +202,48 @@ def prepare_letter(job,profiles,assessment,model,*,profile_dir,output_dir,run,bu
             if old.get('status')=='valid' and (folder/'letter.txt').exists():
                 print('Индивидуальное письмо из кэша. Ручные правки сохранены.')
                 return folder
+            if old.get('status')=='failed':
+                raise CheckError('Проверка письма не выполнена из-за сбоя сервиса: '+str(old.get('error') or '')+
+                    ' Повторите подготовку явно — сохранённый черновик будет перепроверен без новой генерации.')
             raise CheckError('Этот вариант письма уже был отклонён; автоматического платного повтора нет.')
+        reusable=failed_draft(output_dir,job,base_identity)
         folder.mkdir(parents=True,exist_ok=True)
-        record={'identity':identity,'status':'started','company':job['company'],'research':company,'created_at':datetime.now(timezone.utc).isoformat()}
+        record={'identity':identity,'base_identity':base_identity,'status':'started','company':job['company'],'research':company,
+                'audit_model':audit_model,'created_at':datetime.now(timezone.utc).isoformat()}
         payload={'model':model,'messages':[{'role':'system','content':SYSTEM_PROMPT},
             {'role':'user','content':json.dumps({'language':language,'vacancy':{k:job.get(k) for k in assess.JOB_FIELDS},
                 'cv_facts':catalogs,'job_sources':jobs,'company_sources':companies,
                 'company_context_status':company['status'],'previous_openings_to_avoid':previous_letters(output_dir),
-                'assessment':{'decision':assessment['decision'],'gaps':assessment['gaps']}},ensure_ascii=False)}],
+                'assessment':{'decision':assessment['decision'],'gaps':assessment['gaps'],
+                              'matches':assessment.get('matches',[])}},ensure_ascii=False)}],
             'temperature':.4,'max_tokens':1800,'reasoning':{'enabled':False},
             'provider':{'require_parameters':True,'sort':'price','max_price':assess.PRICE_CAP},
             'response_format':{'type':'json_schema','json_schema':{'name':'personal_letter','strict':True,'schema':schema(catalogs,jobs,companies)}}}
         if budget<assess.estimated_cost(payload):raise CheckError('Недостаточно заданного бюджета для письма.')
         try:
-            draft,usage=request_json(session,payload,key,lambda raw:validate(raw,catalogs,jobs,companies))
-            record.update(draft=draft,usage=usage)
+            if reusable:
+                # Paid earlier; only its audit failed. Re-check it against current sources instead of paying again.
+                draft=validate(reusable[1]['draft'],catalogs,jobs,companies)
+                record.update(draft=draft,usage={},reused_draft_from=reusable[0],reused_draft_usage=reusable[1].get('usage',{}))
+                print('Использую сохранённый черновик: прошлый раз не удалась только проверка фактов.')
+            else:
+                draft,usage=request_json(session,payload,key,lambda raw:validate(raw,catalogs,jobs,companies))
+                record.update(draft=draft,usage=usage)
             for old in previous_letters(output_dir):
                 if old['company']!=job['company'] and SequenceMatcher(None,old['opening'],draft['opening']['text']).ratio()>.94:
                     raise CheckError('Начало письма почти повторяет письмо другой компании.')
-            audit_schema=assess.object_schema({'valid':{'type':'boolean'},'issues':{'type':'array','maxItems':8,'items':{'type':'string'}}})
             audit_payload={'model':audit_model,'messages':[{'role':'system','content':AUDIT_PROMPT},
                 {'role':'user','content':json.dumps({'letter':render(draft,language),'draft':draft,
                     'cv_facts':catalogs[draft['cv_variant']],'job_sources':jobs,'company_sources':companies},ensure_ascii=False)}],
                 'max_tokens':2000,'reasoning':{'effort':'low'},
                 'provider':{'require_parameters':True,'sort':'price','max_price':assess.AUDIT_PRICE_CAP},
-                'response_format':{'type':'json_schema','json_schema':{'name':'letter_grounding','strict':True,'schema':audit_schema}}}
+                'response_format':{'type':'json_schema','json_schema':{'name':'letter_grounding','strict':True,'schema':AUDIT_SCHEMA}}}
+            letter=render(draft,language);ignored=[]
             def check_audit(raw):
-                assess.validate_schema(raw,audit_schema)
-                if not raw['valid'] or raw['issues']:raise CheckError('Проверка фактов письма не пройдена: '+'; '.join(raw['issues']))
+                ignored[:]=audit_verdict(raw,letter)
                 return raw
             audit,audit_usage=request_json(session,audit_payload,key,check_audit)
-            record.update(status='valid',audit=audit,audit_usage=audit_usage,audit_model=audit_model)
+            record.update(status='valid',audit=audit,audit_usage=audit_usage,ignored_findings=ignored)
         except CheckError as exc:
             record.update(status='failed' if isinstance(exc,ModelUnavailable) else 'rejected',error=str(exc))
             if isinstance(exc,RejectedOutput):record.update(rejected_usage=exc.usage,rejected_output=exc.result)

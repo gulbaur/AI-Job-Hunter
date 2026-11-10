@@ -183,6 +183,49 @@ class ResilienceTests(unittest.TestCase):
             scheduled_runner.main()
             self.assertEqual(run.call_count,2);wait.assert_called_once_with(30)
 
+    def test_status_names_search_failure_together_with_work_issues(self):
+        # Since 05.11.2026 "Требуют внимания: 3" hid the broken web search in the headline and notifications.
+        import run_status
+        message=run_status.problem({'state':'needs_attention','work_issues':[{'vacancy_id':str(i)} for i in range(3)],
+            'coverage_warnings':['Веб-поиск не работает: выполнено 0 из 6 запросов.']})
+        self.assertIn('Веб-поиск не работает',message);self.assertIn('Требуют внимания вакансии: 3',message)
+
+    def test_killed_run_left_in_started_state_is_reported_as_interrupted(self):
+        import run_status
+        self.assertIn('прервал',run_status.problem({'state':'started','started_at':'2026-11-09T05:00:00+00:00'}))
+
+    def test_runner_notifies_about_previous_run_killed_mid_work(self):
+        data=self.root/'data';data.mkdir()
+        (data/'last_scheduled_run.json').write_text(json.dumps({'started_at':'2026-11-09T05:00:00+00:00','state':'started'}))
+        with patch.object(scheduled_runner,'ROOT',self.root),patch('scheduled_run.main',return_value=0), \
+             patch('subprocess.Popen') as notify:
+            scheduled_runner.main()
+        self.assertIn('-Problem',notify.call_args.args[0])
+
+    def test_window_given_up_after_waiting_for_busy_program_is_a_visible_problem(self):
+        data=self.root/'data';data.mkdir()
+        with patch.object(scheduled_runner,'ROOT',self.root),patch('scheduled_run.main',return_value=75), \
+             patch('scheduled_runner.time.sleep'),patch('subprocess.Popen') as notify:
+            self.assertEqual(scheduled_runner.main(),75)
+        self.assertIn('-Problem',notify.call_args.args[0])
+        state=hunter_web.App(self.root,db_path=self.db).state()['task']
+        self.assertTrue(state['error']);self.assertIn('занята',state['message'])
+
+    def test_each_lost_window_notifies_but_same_failure_report_does_not(self):
+        data=self.root/'data';data.mkdir()
+        with patch.object(scheduled_runner,'ROOT',self.root),patch('scheduled_run.main',return_value=75), \
+             patch('scheduled_runner.time.sleep'),patch('subprocess.Popen') as notify:
+            scheduled_runner.main();scheduled_runner.main()
+        self.assertEqual(notify.call_count,2)
+
+    def test_interrupted_run_is_shown_even_after_earlier_ui_action(self):
+        app=hunter_web.App(self.root,db_path=self.db)
+        app.task['updated_at']='2026-11-09T04:00:00+00:00'
+        data=self.root/'data';data.mkdir()
+        (data/'last_scheduled_run.json').write_text(json.dumps({'started_at':'2026-11-09T05:00:00+00:00','state':'started'}))
+        with patch('hunter_web.is_busy',return_value=False):task=app.state()['task']
+        self.assertTrue(task['error']);self.assertIn('прервал',task['message'])
+
     def test_schedule_failure_is_visible_and_manual_skip_can_be_restored(self):
         app=hunter_web.App(self.root,db_path=self.db)
         data=self.root/'data';data.mkdir()

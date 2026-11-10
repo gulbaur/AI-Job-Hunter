@@ -23,6 +23,18 @@ def write_json(path,value):
         if os.path.exists(temporary):os.unlink(temporary)
 
 
+def api_error_detail(response,limit=300):
+    """Provider's own error text (OpenRouter `error.message`), shortened; never headers or request data."""
+    try:message=response.json()['error']['message']
+    except Exception:return ''
+    return ' '.join(str(message).split())[:limit] if message else ''
+
+
+def http_error_text(prefix,response):
+    detail=api_error_detail(response)
+    return f'{prefix}: HTTP {response.status_code}'+(f' — {detail}' if detail else '')+'.'
+
+
 class DescriptionParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)

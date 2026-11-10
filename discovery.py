@@ -57,7 +57,7 @@ def print_summary(report):
     if web:
         state={'fresh':'использованы свежие сохранённые результаты',
                'missing':'нет сохранённых результатов','stale':'сохранённые результаты устарели',
-               'partial':'сохранённые результаты неполные'}.get(web['status'],'результаты требуют проверки')
+               'partial':'часть запросов завершилась ошибкой','failed':'ни один запрос не выполнен'}.get(web['status'],'результаты требуют проверки')
         print('Веб-поиск: '+state+'. Поиск выполняется программой через OpenRouter.')
     manual=sum(e.get('status')=='manual_link' for e in entries)
     unreadable=sum(e.get('status') in {'needs_adapter','error','unavailable'} for e in entries)
@@ -129,11 +129,12 @@ def web_input(path,settings):
     if data.get('plan_hash')!=expected:return [],[],'settings_changed'
     queries=data.get('queries');links=data.get('candidates')
     if (not isinstance(queries,list) or len(queries)>6 or not isinstance(links,list) or len(links)>30
-        or not all(isinstance(q,dict) and q.get('status') in {'ok','error'} and isinstance(q.get('q'),str) for q in queries)
+        or not all(isinstance(q,dict) and q.get('status') in {'ok','error','skipped'} and isinstance(q.get('q'),str) for q in queries)
         or not all(isinstance(v,dict) and isinstance(v.get('url'),str) for v in links)):
         raise CheckError('Некорректный результат веб-поиска.')
     if [q['q'] for q in queries]!=sources.web_plan(settings):return [],queries,'incomplete_plan'
-    return links,queries,'partial' if any(q['status']=='error' for q in queries) else 'fresh'
+    if queries and not any(q['status']=='ok' for q in queries):return links,queries,'failed'
+    return links,queries,'partial' if any(q['status']!='ok' for q in queries) else 'fresh'
 
 
 def coverage_warnings(report):
@@ -144,7 +145,14 @@ def coverage_warnings(report):
             warnings.append('HH проверен не полностью. '+entry.get('details',{}).get('error',
                 'Не удалось прочитать вакансии через браузер; проверьте вход в HH и журнал.'))
         elif entry.get('source')=='Веб-поиск' and entry.get('status') not in {'fresh','checked'}:
-            warnings.append('Веб-поиск выполнен не полностью; подробности — в отчёте об источниках.')
+            queries=[q for q in entry.get('queries') or [] if isinstance(q,dict)]
+            done=sum(q.get('status')=='ok' for q in queries)
+            first=next((q.get('error') for q in queries if q.get('status')=='error' and q.get('error')),'')
+            if entry.get('status')=='failed':
+                warnings.append(f'Веб-поиск не работает: выполнено {done} из {len(queries)} запросов. '+(first or 'Подробности — в отчёте об источниках.'))
+            elif entry.get('status')=='partial':
+                warnings.append((f'Веб-поиск выполнен частично: с ошибкой {len(queries)-done} из {len(queries)} запросов. '+(first or '')).strip())
+            else:warnings.append('Веб-поиск выполнен не полностью; подробности — в отчёте об источниках.')
         elif entry.get('slug') and entry.get('status')=='error':
             warnings.append('Не удалось проверить доску компании: '+entry.get('source',''))
     return warnings

@@ -57,8 +57,10 @@ def relevant_facts(job: dict, catalogs: dict) -> dict:
     # Generic RAG/API paragraphs are poor evidence for a classical Data Scientist
     # role. Prefer actual model evaluation/training/inference where available;
     # this still does not imply experience with tabular boosting.
+    # A "Data Scientist" title over RAG/LLM tasks (Parametric 138879721) must keep RAG/LLM facts.
     title = job["title"]
-    if re.search(r"Data\s+Scientist", title, re.I) and not re.search(r"\bLLM\b|\bRAG\b", title, re.I):
+    tasks = title + " " + str(job.get("description_text") or "")
+    if re.search(r"Data\s+Scientist", title, re.I) and not re.search(r"\bLLM\b|\bRAG\b", tasks, re.I):
         selected = {}
         for variant, facts in catalogs.items():
             core = {identity: text for identity, text in facts.items() if re.search(

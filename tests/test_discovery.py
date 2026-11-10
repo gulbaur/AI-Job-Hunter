@@ -152,6 +152,24 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(discovery.web_input(self.web([],plan_hash='different'),self.settings)[2],'settings_changed')
         self.assertEqual(discovery.web_input(self.web([],queries=[]),self.settings)[2],'incomplete_plan')
 
+    def test_web_search_total_failure_is_reported_as_failed_not_partial(self):
+        plan=sources.web_plan(self.settings)
+        error='Веб-поиск OpenRouter: HTTP 404 — No endpoints found.'
+        queries=[{'q':plan[0],'status':'error','error':error}]+[
+            {'q':q,'status':'skipped','error':'Не выполнялся: '+error} for q in plan[1:]]
+        self.assertEqual(discovery.web_input(self.web([],queries=queries),self.settings)[2],'failed')
+        warnings=discovery.coverage_warnings({'sources':[{'source':'Веб-поиск','status':'failed','queries':queries}]})
+        self.assertEqual(len(warnings),1)
+        self.assertIn('не работает',warnings[0]);self.assertIn('HTTP 404',warnings[0])
+        self.assertIn(f'0 из {len(plan)}',warnings[0])
+
+    def test_web_search_partial_failure_counts_failed_queries(self):
+        plan=sources.web_plan(self.settings)
+        queries=[{'q':plan[0],'status':'error','error':'Веб-поиск OpenRouter: HTTP 429.'}]+[{'q':q,'status':'ok'} for q in plan[1:]]
+        self.assertEqual(discovery.web_input(self.web([],queries=queries),self.settings)[2],'partial')
+        warnings=discovery.coverage_warnings({'sources':[{'source':'Веб-поиск','status':'partial','queries':queries}]})
+        self.assertIn(f'1 из {len(plan)}',warnings[0])
+
     def test_source_collision_and_legacy_queue_migration_preserve_both_packets(self):
         self.store.save(vacancy('1'))
         item=vacancy('1');item['alternate_url']='https://example.com/jobs/1';self.store.save(item,source='web')

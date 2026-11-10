@@ -17,6 +17,7 @@ from apply import SCHEMA, now
 SUBMIT = '[data-qa="vacancy-response-submit-popup"]'
 LETTER = '[data-qa="vacancy-response-popup-form-letter-input"]'
 TOGGLE = '[data-qa="vacancy-response-letter-toggle"]'
+SUCCESS_TIMEOUT_MS = 15000
 
 
 def success_marker(page):
@@ -140,11 +141,12 @@ def prepare_page(page, packet):
     return titles[0]
 
 
-def run(packet, db, *, allow_send=False, prompt=input, profile_dir=PROFILE_DIR, confirmation_channel=None):
+def run(packet, db, *, allow_send=False, prompt=input, profile_dir=PROFILE_DIR, confirmation_channel=None, result_channel=None):
     from playwright.sync_api import sync_playwright
     output = Path(packet['output_dir']); output.mkdir(parents=True, exist_ok=True)
     fingerprint = identity(packet)
-    interactive=bool(sys.stdin is not None and sys.stdin.isatty())
+    # With a UI channel the console is never asked: a hidden console prompt would hang the web flow.
+    interactive=bool(sys.stdin is not None and sys.stdin.isatty()) and confirmation_channel is None
     if allow_send and not interactive and confirmation_channel is None:
         raise CheckError('Реальная отправка требует интерактивной консоли.')
     reserve(db, packet, fingerprint)
@@ -188,15 +190,21 @@ def run(packet, db, *, allow_send=False, prompt=input, profile_dir=PROFILE_DIR, 
             # Success wording is deliberately narrow. Unknown UI never triggers a second click.
             success = success_marker(page)
             try:
-                success.first.wait_for(state='visible',timeout=15000)
+                success.first.wait_for(state='visible',timeout=SUCCESS_TIMEOUT_MS)
                 state='confirmed_by_site'
             except Exception:
                 state='submitted_unverified'
             if state!='confirmed_by_site':
                 print('Подтверждение пока не найдено. Если сайт показал капчу, пройдите её вручную в этом окне. Не нажимайте отправку повторно.')
-            if interactive:
+            if state!='confirmed_by_site' and interactive:
                 try:prompt('Проверьте результат в браузере. Enter — проверить ещё раз и закрыть: ')
                 except EOFError:pass
+            elif state!='confirmed_by_site' and result_channel is not None:
+                # Keep the window open: the user may need to pass a captcha before HH shows the result.
+                result_channel({**review,'state':'submitted_unverified'})
+            if state!='confirmed_by_site':
+                try:page.wait_for_load_state('load',timeout=5000)
+                except Exception:pass
             if state!='confirmed_by_site' and any(success.nth(i).is_visible() for i in range(success.count())):
                 state='confirmed_by_site'
             set_state(db,packet['url'],state)
