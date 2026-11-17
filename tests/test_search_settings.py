@@ -42,6 +42,10 @@ class SettingsTests(unittest.TestCase):
         self.assertIsNone(cfg['budget_usd'])
         self.assertEqual(search_settings.validate({'budget_usd':1})['budget_usd'],1)
 
+    def test_a_new_profile_starts_with_a_money_limit_per_run(self):
+        # Publication review 17.11.2026: a fresh clone must not spend without a cap; «no limit» stays an explicit choice.
+        self.assertEqual(search_settings.validate({})['budget_usd'],0.5)
+
     def test_menu_saves_real_settings_without_changing_geography(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);profile=root/'profile';profile.mkdir()

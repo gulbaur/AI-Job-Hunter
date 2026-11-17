@@ -6,7 +6,7 @@ from common import CheckError
 
 DEFAULTS = {'role_groups':['junior','ml_ds','applied_ai'], 'junior_experience':True,
             'search_days':30, 'pages_per_query':2, 'vacancies_per_run':10,
-            'budget_usd':None, 'excluded_title_words':[], 'custom_roles':[], 'scan_limit':12,
+            'budget_usd':0.5, 'excluded_title_words':[], 'custom_roles':[], 'scan_limit':12,
             'letter_mode':'personalized'}
 GROUPS = {'junior':'Junior и стажировки', 'ml_ds':'ML и Data Science',
           'applied_ai':'Applied AI, LLM, NLP и Computer Vision'}
