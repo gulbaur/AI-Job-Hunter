@@ -64,7 +64,7 @@ def rewrite(root,store,key,instruction,*,base_text=None,session,api_key,model,au
     if not instruction or len(instruction)>MAX_INSTRUCTION:raise CheckError('Указание должно быть от 1 до 1000 символов.')
     letter,facts,jobs,companies,vacancy=_context(root,store,key)
     current=base_text or letter
-    payload={'model':model,'messages':[{'role':'system','content':SYSTEM_PROMPT},
+    payload={'model':model,'messages':[{'role':'system','content':assess.with_candidate(SYSTEM_PROMPT)},
         {'role':'user','content':json.dumps({'instruction':instruction,'letter':current,'vacancy':vacancy,'cv_facts':facts,
             'job_sources':jobs,'company_sources':companies},ensure_ascii=False)}],
         'temperature':.3,'max_tokens':1800,'reasoning':{'enabled':False},

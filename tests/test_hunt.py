@@ -156,7 +156,7 @@ class HuntTests(unittest.TestCase):
         with self.assertRaises(CheckError):hh_response.reserve(self.store.connection,packet,key)
 
     def test_missing_cv_stops_the_run_before_any_paid_search(self):
-        # Publication review 17.11.2026: a fresh clone with an empty profile/ paid for web search before failing on the CV.
+        # 17.11.2026: a fresh clone with an empty profile/ paid for web search before failing on the CV.
         last=self.root/'data/last.json'
         with patch.object(hunt,'ROOT',self.root),patch.object(hunt,'LAST',last), \
              patch.object(hunt,'JobStore',side_effect=lambda:JobStore(self.root/'jobs.sqlite')), \
@@ -172,7 +172,11 @@ class HuntTests(unittest.TestCase):
             with self.assertRaises(CheckError) as error:hunt.check_profile(self.profile)
             self.assertIn('preferences.json',str(error.exception))
             (self.profile/'preferences.json').write_text(json.dumps(PREF),encoding='utf-8')
-            hunt.check_profile(self.profile)
+            with patch.object(assess,'CANDIDATE_FILE',self.profile/'candidate.md'):
+                with self.assertRaises(CheckError) as error:hunt.check_profile(self.profile)
+                self.assertIn('candidate.md',str(error.exception))
+                (self.profile/'candidate.md').write_text('<!-- hint -->\nЦель: Junior ML.',encoding='utf-8')
+                hunt.check_profile(self.profile)
 
     def test_no_network_in_preview_and_no_browser_for_already_sent_resume(self):
         with patch.object(hunt,'ROOT',self.root),patch.object(hunt,'DB_PATH',self.root/'jobs.sqlite'), \

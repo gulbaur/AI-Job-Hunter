@@ -23,14 +23,15 @@ from storage import JobStore, DB_PATH
 ROOT = Path(__file__).resolve().parent
 VERSION = "literal-cv-letter-v2"
 RU_FILES = {variant: filename.replace("_EN.docx", "_RU.docx") for variant, filename in assess.CV_FILES.items()}
-ACTION = re.compile(r"^(?:Оценивала|Анализировала|Участвовала|Тестировала|Проводила|Разрабатывала|"
-                    r"Выявила|Дорабатывала|Сравнивала|Определяла|Самостоятельно|Реализовала|"
-                    r"Добавила|Интегрировала|Исследовала|Проверяла|"
-                    # Perfective forms too: a new CV bullet «Разработала…» must not be silently ignored (11.11.2026).
-                    r"Разработала|Создала|Построила|Провела|Настроила|Подготовила|Составила|Написала|Спроектировала|"
-                    r"Внедрила|Обучила|Дообучила|Собрала|Разметила|Автоматизировала|Оптимизировала|Описала|"
-                    r"Сформулировала|Предложила|Организовала|Протестировала|Проанализировала|Оценила|Сравнила|"
-                    r"Улучшила|Доработала|Исследовала|Проверила|Участвовала)\b")
+ACTION_VERBS = ("Оценивала Анализировала Участвовала Тестировала Проводила Разрабатывала Выявила Дорабатывала "
+                "Сравнивала Определяла Реализовала Добавила Интегрировала Исследовала Проверяла "
+                # Perfective forms too: a new CV bullet «Разработала…» must not be silently ignored (11.11.2026).
+                "Разработала Создала Построила Провела Настроила Подготовила Составила Написала Спроектировала "
+                "Внедрила Обучила Дообучила Собрала Разметила Автоматизировала Оптимизировала Описала "
+                "Сформулировала Предложила Организовала Протестировала Проанализировала Оценила Сравнила "
+                "Улучшила Доработала Проверила").split()
+# Past tense of any grammatical gender: «Разработала» and «Разработал».
+ACTION = re.compile(r"^(?:Самостоятельно|" + "|".join(dict.fromkeys(v[:-1] + "а?" for v in ACTION_VERBS)) + r")\b")
 EN_ACTION=re.compile(r'^(?:Developed|Implemented|Evaluated|Refined|Identified|Tested|Conducted|Participated|Integrated|Built|Designed|Investigated|Analyzed|Assessed|Independently|Contributed|Performed|Compared|Proposed|Improved|Supported|'
                      r'Created|Wrote|Prepared|Drafted|Defined|Documented|Automated|Optimized|Trained|Fine-tuned|Deployed|Collected|Labeled|Organized|Researched|'
                      r'Added|Collaborated|Ran|Reviewed|Examined)\b')

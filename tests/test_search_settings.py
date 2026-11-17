@@ -43,7 +43,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(search_settings.validate({'budget_usd':1})['budget_usd'],1)
 
     def test_a_new_profile_starts_with_a_money_limit_per_run(self):
-        # Publication review 17.11.2026: a fresh clone must not spend without a cap; «no limit» stays an explicit choice.
+        # 17.11.2026: a fresh clone must not spend without a cap; «no limit» stays an explicit choice.
         self.assertEqual(search_settings.validate({})['budget_usd'],0.5)
 
     def test_menu_saves_real_settings_without_changing_geography(self):

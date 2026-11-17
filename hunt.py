@@ -159,13 +159,14 @@ def is_outage(exc):
 
 
 def check_profile(profile_dir):
-    """Before any paid call: the CVs letters need exist and contain usable facts (publication review 17.11.2026)."""
+    """Before any paid call: the CVs letters need exist and contain usable facts (added 17.11.2026)."""
     try:
         english=assess.load_profiles(profile_dir)
         russian={variant:assess.read_cv(profile_dir/name) for variant,name in prepare.RU_FILES.items()}
         prepare.fact_catalog(english,'en');prepare.fact_catalog(russian,'ru')
         # Without it every geography passes silently; a run must not start like that.
         if load_preferences(profile_dir) is None:raise CheckError('Нет файла profile/preferences.json с географией поиска.')
+        if not assess.candidate_profile():raise CheckError('Заполните profile/candidate.md: цель поиска и от чьего лица писать письма.')
     except CheckError as exc:
         raise CheckError(f'{exc} Проверьте папку profile/; образец и требования к CV — examples/profile.') from None
 

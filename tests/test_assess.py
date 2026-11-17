@@ -86,6 +86,21 @@ class AssessTests(unittest.TestCase):
         self.assertEqual(saved["status"], "viewed")
         self.assertEqual(saved["first_seen_at"], "2026-10-20T10:00:00Z")
 
+    def test_candidate_writes_the_search_goal_used_by_every_prompt(self):
+        import letter_rewrite
+        import personalized
+        path = Path(self.temp.name) / "candidate.md"
+        path.write_text("<!-- hint for the user -->\nЦель: Data Analyst, Караганда.", encoding="utf-8")
+        with patch.object(assess, "CANDIDATE_FILE", path):
+            system = assess.build_payload(self.job, PROFILES, "m", assessment_date="2026-10-20")["messages"][0]["content"]
+            self.assertIn("Цель: Data Analyst, Караганда.", system)
+            self.assertNotIn("hint for the user", system)
+            for prompt in (personalized.SYSTEM_PROMPT, letter_rewrite.SYSTEM_PROMPT):
+                self.assertIn("Цель: Data Analyst, Караганда.", assess.with_candidate(prompt))
+        # The public prompts name no particular candidate.
+        for prompt in (assess.SYSTEM_PROMPT, personalized.SYSTEM_PROMPT, personalized.AUDIT_PROMPT, letter_rewrite.SYSTEM_PROMPT):
+            self.assertNotRegex(prompt, r"Алмат|Strong Junior|женщин|кандидатк")
+
     def test_profile_job_and_model_changes_invalidate_cache(self):
         self.run_assess(run=True)
         changed = {**PROFILES, "applied_ai": PROFILES["applied_ai"] + " New project."}

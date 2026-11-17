@@ -104,10 +104,16 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(len(prepare.fact_catalog(en, "en")["applied_ai"]), 2)
         more = {"applied_ai": "Added retries and structured errors to the payment API client.\n"
                               "Collaborated with analysts to define labeling rules for the review classifier.\n"
-                              "Ran evaluation of image classification models on product photos from the catalog.\n"
+                              "Ran evaluation of image models on product photos from the catalog.\n"
                               "Reviewed model outputs against expert labels to find systematic errors.\n"
                               "Examined retrieval failures in the RAG search over product manuals."}
         self.assertEqual(len(prepare.fact_catalog(more, "en")["applied_ai"]), 5)
+
+    def test_russian_facts_are_found_for_any_grammatical_gender(self):
+        male = {"applied_ai": "Разработал сервис рекомендаций товаров на Python и PostgreSQL.\n"
+                              "Обучил модель классификации отзывов покупателей на PyTorch.\n"
+                              "Оценивал качество ответов чат-бота на выборке реальных обращений."}
+        self.assertEqual(len(prepare.fact_catalog(male)["applied_ai"]), 3)
 
     def test_cross_cv_unknown_and_duplicate_facts_are_rejected(self):
         catalogs = prepare.fact_catalog(PROFILES)

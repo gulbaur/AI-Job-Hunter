@@ -281,7 +281,7 @@ def prepare_letter(job,profiles,assessment,model,*,profile_dir,output_dir,run,bu
         folder.mkdir(parents=True,exist_ok=True)
         record={'identity':identity,'base_identity':base_identity,'status':'started','company':job['company'],'research':company,
                 'audit_model':audit_model,'created_at':datetime.now(timezone.utc).isoformat()}
-        payload={'model':model,'messages':[{'role':'system','content':SYSTEM_PROMPT},
+        payload={'model':model,'messages':[{'role':'system','content':assess.with_candidate(SYSTEM_PROMPT)},
             {'role':'user','content':json.dumps({'language':language,'vacancy':{k:job.get(k) for k in assess.JOB_FIELDS},
                 'cv_facts':catalogs,'job_sources':jobs,'company_sources':companies,
                 'company_context_status':company['status'],'previous_openings_to_avoid':previous_letters(output_dir),

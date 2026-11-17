@@ -66,6 +66,23 @@ coverage=partial при совпадении только части. Не сч�
 """
 
 
+CANDIDATE_FILE = ROOT / "profile" / "candidate.md"
+
+
+def candidate_profile() -> str:
+    """The candidate's own words: search goal, geography, how letters speak (profile/candidate.md)."""
+    try:
+        text = CANDIDATE_FILE.read_text(encoding="utf-8-sig")
+    except OSError:
+        return ""
+    return re.sub(r"<!--.*?-->", "", text, flags=re.S).strip()[:3000]
+
+
+def with_candidate(prompt: str) -> str:
+    text = candidate_profile()
+    return prompt + ("\n\nПрофиль кандидата (написан самим кандидатом):\n" + text if text else "")
+
+
 def object_schema(properties: dict) -> dict:
     return {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}
 
@@ -279,7 +296,7 @@ def build_payload(job: dict, profiles: dict[str, str], model: str, *, assessment
         "model": model,
         # Some endpoints treat response_format as a hint; also describe the contract
         # in the model-visible prompt, and always validate it locally afterwards.
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT +
+        "messages": [{"role": "system", "content": with_candidate(SYSTEM_PROMPT) +
                       "\nВерни объект ТОЧНО по этой JSON Schema, без иных ключей:\n" +
                       json.dumps(schema, ensure_ascii=False)},
                      {"role": "user", "content": json.dumps(data, ensure_ascii=False)}],
