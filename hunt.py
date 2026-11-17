@@ -158,6 +158,18 @@ def is_outage(exc):
     return isinstance(exc,model_api.ModelUnavailable) or 'бюджет' in str(exc).casefold()
 
 
+def check_profile(profile_dir):
+    """Before any paid call: the CVs letters need exist and contain usable facts (publication review 17.11.2026)."""
+    try:
+        english=assess.load_profiles(profile_dir)
+        russian={variant:assess.read_cv(profile_dir/name) for variant,name in prepare.RU_FILES.items()}
+        prepare.fact_catalog(english,'en');prepare.fact_catalog(russian,'ru')
+        # Without it every geography passes silently; a run must not start like that.
+        if load_preferences(profile_dir) is None:raise CheckError('Нет файла profile/preferences.json с географией поиска.')
+    except CheckError as exc:
+        raise CheckError(f'{exc} Проверьте папку profile/; образец и требования к CV — examples/profile.') from None
+
+
 def prepare_batch(store,jobs,*,model,profile_dir,output,session,run,budget,preferences,key='',limit=3,settings=None):
     profiles=assess.load_profiles(profile_dir)
     for job in jobs:
@@ -340,6 +352,7 @@ def main(argv=None):
                 ids=[rewrite or retry] if rewrite or retry else ([args.vacancy_id] if args.vacancy_id else None)
                 if args.run and not args.from_db and not args.vacancy_id and not rewrite and not retry:
                     import discovery
+                    check_profile(ROOT/'profile')
                     print('1/4. Поиск: HH, сайты компаний и результаты веб-поиска.')
                     load_dotenv(ROOT/'.env',override=False,encoding='utf-8-sig',interpolate=False)
                     model=os.getenv('OPENROUTER_MODEL',assess.DEFAULT_MODEL).strip() or assess.DEFAULT_MODEL

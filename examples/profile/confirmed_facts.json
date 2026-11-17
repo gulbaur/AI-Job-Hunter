@@ -1,0 +1,7 @@
+[
+  {
+    "en": "Built a small RAG demo over course notes with FastAPI and SQLite.",
+    "ru": "Сделала небольшое RAG-демо по конспектам курса на FastAPI и SQLite.",
+    "source": "Example: a fact the candidate confirmed in conversation, not written in the CV"
+  }
+]

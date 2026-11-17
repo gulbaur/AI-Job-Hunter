@@ -5,6 +5,7 @@ import os
 import sqlite3
 import sys
 from contextlib import closing
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -12,6 +13,7 @@ from dotenv import load_dotenv
 
 from hh import CheckError, ENV_PATH, HHClient, TIMEOUT, html_to_text
 
+ROOT = Path(__file__).resolve().parent
 OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
 
 
@@ -129,6 +131,33 @@ def check_sqlite() -> str:
     return "OK"
 
 
+def check_profile(profile_dir: Path = ROOT / "profile") -> str:
+    """The CVs and facts letters need; checked here so a new user learns it before any paid run."""
+    import hunt
+    hunt.check_profile(profile_dir)
+    print("Профиль: CV прочитаны, факты для писем найдены.")
+    return "OK"
+
+
+def check_browser() -> str:
+    """Playwright's Chromium is installed (HH search and sending use it)."""
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as playwright:
+        if not Path(playwright.chromium.executable_path).exists():
+            raise CheckError(r"Chromium не установлен: .venv\Scripts\python.exe -m playwright install chromium")
+    print("Браузер Chromium для Playwright установлен.")
+    return "OK"
+
+
+CHECKS = (
+    ("HH API", check_hh),
+    ("OpenRouter", check_openrouter),
+    ("SQLite", check_sqlite),
+    ("Профиль", check_profile),
+    ("Браузер", check_browser),
+)
+
+
 def main() -> int:
     # UTF-8 output also works when stdout is redirected on Windows.
     for stream in (sys.stdout, sys.stderr):
@@ -144,11 +173,7 @@ def main() -> int:
         failed = True
 
     results: list[tuple[str, str]] = []
-    for name, check in (
-        ("HH API", check_hh),
-        ("OpenRouter", check_openrouter),
-        ("SQLite", check_sqlite),
-    ):
+    for name, check in CHECKS:
         print(f"\n--- {name} ---", flush=True)
         try:
             status = check()

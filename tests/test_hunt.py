@@ -155,6 +155,25 @@ class HuntTests(unittest.TestCase):
         with self.assertRaises(CheckError):hh_response.begin_submit(self.store.connection,packet,key)
         with self.assertRaises(CheckError):hh_response.reserve(self.store.connection,packet,key)
 
+    def test_missing_cv_stops_the_run_before_any_paid_search(self):
+        # Publication review 17.11.2026: a fresh clone with an empty profile/ paid for web search before failing on the CV.
+        last=self.root/'data/last.json'
+        with patch.object(hunt,'ROOT',self.root),patch.object(hunt,'LAST',last), \
+             patch.object(hunt,'JobStore',side_effect=lambda:JobStore(self.root/'jobs.sqlite')), \
+             patch('discovery.collect') as collect,patch('requests.Session.post') as post, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(hunt.main(['--run','--queue']),1)
+        collect.assert_not_called();post.assert_not_called()
+        error=json.loads(last.read_text(encoding='utf-8'))['error']
+        self.assertIn('CV_ML_ENGINEER_EN.docx',error);self.assertIn('examples/profile',error)
+
+    def test_profile_without_geography_settings_is_not_searched_with_filters_silently_off(self):
+        with patch.object(assess,'load_profiles',return_value=EN),patch.object(assess,'read_cv',return_value=RU):
+            with self.assertRaises(CheckError) as error:hunt.check_profile(self.profile)
+            self.assertIn('preferences.json',str(error.exception))
+            (self.profile/'preferences.json').write_text(json.dumps(PREF),encoding='utf-8')
+            hunt.check_profile(self.profile)
+
     def test_no_network_in_preview_and_no_browser_for_already_sent_resume(self):
         with patch.object(hunt,'ROOT',self.root),patch.object(hunt,'DB_PATH',self.root/'jobs.sqlite'), \
              patch.object(assess,'load_profiles',return_value=EN),patch.object(assess,'read_cv',return_value=RU), \

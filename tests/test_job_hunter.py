@@ -335,6 +335,13 @@ class JobHunterTests(unittest.TestCase):
             "<p>First &amp; second</p><script>hidden()</script><p>Last<br/>Line</p>"
         ), "First & second\nLast\nLine")
 
+    def test_setup_check_reports_an_empty_profile_with_a_pointer_to_the_example(self):
+        with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(self.output):
+            with self.assertRaises(hh.CheckError) as error:
+                check_setup.check_profile(Path(folder))
+        self.assertIn("examples/profile", str(error.exception))
+        self.assertIn("Профиль", [name for name, _ in check_setup.CHECKS])  # part of the normal run
+
     def test_existing_hh_and_sqlite_checks_reuse_client_without_openrouter(self):
         def fake_get(session, url, **kwargs):
             self.transport(session, url, kwargs)
