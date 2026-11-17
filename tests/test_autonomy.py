@@ -127,6 +127,13 @@ class AutonomyTests(unittest.TestCase):
         with self.assertRaises(CheckError) as caught:model_api.request_json(session,{'model':' '},'fixture',lambda raw:raw)
         self.assertIn('OPENROUTER_MODEL',str(caught.exception));session.post.assert_not_called()
 
+    def test_web_refresh_with_explicit_key_and_model_does_not_load_the_real_env(self):
+        # Tests and callers that pass credentials must not pull the user's .env (API key) into the process.
+        session=Mock();session.post.return_value=error_response(404,'No endpoints found')
+        with patch.object(web_search,'load_dotenv') as loader,patch.object(web_search.sources,'web_plan',return_value=['q1']),              contextlib.redirect_stdout(io.StringIO()):
+            web_search.refresh({},self.root/'web.json',session=session,key='fixture',model='test')
+        loader.assert_not_called()
+
     def test_web_refresh_stops_series_after_configuration_error(self):
         session=Mock();session.post.return_value=error_response(404,'No endpoints found')
         with patch.object(web_search.sources,'web_plan',return_value=['q1','q2','q3']), \

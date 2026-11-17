@@ -83,7 +83,7 @@ def cached_query(query,*,session,key,model,cache_dir,ttl_hours=2):
 
 
 def refresh(settings,output,*,session=None,key=None,model=None):
-    load_dotenv(ROOT/'.env',override=False,interpolate=False,encoding='utf-8-sig')
+    if key is None or not model:load_dotenv(ROOT/'.env',override=False,interpolate=False,encoding='utf-8-sig')
     key=os.getenv('OPENROUTER_API_KEY','') if key is None else key
     model=model or os.getenv('OPENROUTER_MODEL',assess.DEFAULT_MODEL)
     queries=sources.web_plan(settings);records=[];urls=[];cost=0.;calls=0
