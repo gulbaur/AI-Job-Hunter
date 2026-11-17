@@ -342,6 +342,21 @@ class JobHunterTests(unittest.TestCase):
         self.assertIn("examples/profile", str(error.exception))
         self.assertIn("Профиль", [name for name, _ in check_setup.CHECKS])  # part of the normal run
 
+    def test_hh_api_refusal_without_token_is_skipped_because_search_uses_the_browser(self):
+        # 17.11.2026: anonymous /vacancies returns HTTP 403 for everyone; the program reads HH through Playwright.
+        def fake_get(session, url, **kwargs):
+            if url.endswith("/areas"):
+                return response(AREAS)
+            return response({"errors": [{"type": "forbidden"}]}, status=403)
+        for token, expected in (("", "SKIP"), (HH_SECRET, None)):
+            with patch.dict(os.environ, {"HH_ACCESS_TOKEN": token}), \
+                 patch.object(requests.Session, "get", new=fake_get), contextlib.redirect_stdout(self.output):
+                if expected:
+                    self.assertEqual(check_setup.check_hh(), expected)
+                else:
+                    with self.assertRaises(hh.CheckError):check_setup.check_hh()
+        self.assertIn("браузер", self.output.getvalue())
+
     def test_existing_hh_and_sqlite_checks_reuse_client_without_openrouter(self):
         def fake_get(session, url, **kwargs):
             self.transport(session, url, kwargs)

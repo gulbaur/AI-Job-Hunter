@@ -58,7 +58,15 @@ def check_hh() -> str:
     with HHClient() as client:
         area_id = client.kazakhstan_id()
         print(f"Казахстан: ID {area_id} (получен из /areas).")
-        result = client.search("machine learning", area_id, page=0, per_page=3)
+        try:
+            result = client.search("machine learning", area_id, page=0, per_page=3)
+        except CheckError as exc:
+            # Anonymous vacancy search is closed by HH (HTTP 403); the program itself reads HH through the browser.
+            if client.has_token or not str(exc).startswith("HTTP 403"):
+                raise
+            print("Поиск через API HH без токена закрыт (HTTP 403). Программе он не нужен: "
+                  "вакансии HH читаются через браузер после входа в hh_login.cmd.")
+            return "SKIP"
         items = result["items"][:3]
         print(f"Получено вакансий: {len(items)}.")
         if not items:
