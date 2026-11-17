@@ -51,7 +51,9 @@ def load(profile):
 
 def save(profile,config):
     path=Path(profile)/'sources.json';path.parent.mkdir(parents=True,exist_ok=True)
-    temp=path.with_suffix('.tmp');temp.write_text(json.dumps(validate(config),ensure_ascii=False,indent=2)+'\n',encoding='utf-8');temp.replace(path)
+    temp=path.with_suffix('.tmp');temp.write_text(json.dumps(validate(config),ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+    from common import replace_file
+    replace_file(temp,path)  # Windows: a reader may briefly hold the file
 
 
 def canonical_url(value):
@@ -123,34 +125,45 @@ def vacancy(url,title,company,region,description,published='',applicant_location
             'description':description,'published_at':published or '', 'applicant_locations':applicant_locations}
 
 
-def board_jobs(client,board):
+def _ashby(item,name):
+    if item.get('isListed') is False:return None
+    remote=item.get('workplaceType') or ('Remote' if item.get('isRemote') else '')
+    region=item.get('location','')
+    body=item.get('descriptionHtml') or item.get('descriptionPlain') or ''
+    if not body.strip():raise CheckError('Доска содержит вакансию без полного описания.')
+    return vacancy(item['jobUrl'],item['title'],name,region,
+        f"<p>Location: {region}. Workplace: {remote}.</p>"+body,item.get('publishedAt',''))
+
+
+def _greenhouse(item,name):
+    from html import unescape
+    region=item.get('location',{}).get('name','')
+    if not item.get('content','').strip():raise CheckError('Доска содержит вакансию без полного описания.')
+    return vacancy(item['absolute_url'],item['title'],name,region,
+        '<p>Location: '+region+'</p>'+unescape(item.get('content','')),item.get('first_published') or item.get('updated_at',''))
+
+
+def _lever(item,name):
+    region=item.get('categories',{}).get('location','')
+    description=item.get('description','')+''.join('<h3>'+v.get('text','')+'</h3>'+v.get('content','') for v in item.get('lists',[]))+item.get('additional','')
+    description='<p>Location: '+region+'. Workplace: '+str(item.get('workplaceType',''))+'</p>'+description
+    stamp=datetime.fromtimestamp(item['createdAt']/1000,timezone.utc).isoformat() if item.get('createdAt') else ''
+    return vacancy(item['hostedUrl'],item['text'],name,region,description,stamp)
+
+
+def board_jobs(client,board,*,errors=None):
+    """Vacancies of one board. A malformed card is skipped and its title appended to `errors`
+    (without `errors` it raises), so one «General Application» never hides the rest of the board."""
     slug=board['slug'];kind=board['kind'];name=board['name']
-    if kind=='ashby':
-        data=client.json(f'https://api.ashbyhq.com/posting-api/job-board/{slug}')
-        for item in data['jobs']:
-            if item.get('isListed') is False:continue
-            remote=item.get('workplaceType') or ('Remote' if item.get('isRemote') else '')
-            region=item.get('location','')
-            body=item.get('descriptionHtml') or item.get('descriptionPlain') or ''
-            if not body.strip():raise CheckError('Доска содержит вакансию без полного описания.')
-            yield vacancy(item['jobUrl'],item['title'],name,region,
-                f"<p>Location: {region}. Workplace: {remote}.</p>"+body,item.get('publishedAt',''))
-    elif kind=='greenhouse':
-        data=client.json(f'https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true')
-        for item in data['jobs']:
-            from html import unescape
-            region=item.get('location',{}).get('name','')
-            if not item.get('content','').strip():raise CheckError('Доска содержит вакансию без полного описания.')
-            yield vacancy(item['absolute_url'],item['title'],name,region,
-                '<p>Location: '+region+'</p>'+unescape(item.get('content','')),item.get('updated_at',''))
-    else:
-        data=client.json(f'https://api.lever.co/v0/postings/{slug}?mode=json')
-        for item in data:
-            region=item.get('categories',{}).get('location','')
-            description=item.get('description','')+''.join('<h3>'+v.get('text','')+'</h3>'+v.get('content','') for v in item.get('lists',[]))+item.get('additional','')
-            description='<p>Location: '+region+'. Workplace: '+str(item.get('workplaceType',''))+'</p>'+description
-            stamp=datetime.fromtimestamp(item['createdAt']/1000,timezone.utc).isoformat() if item.get('createdAt') else ''
-            yield vacancy(item['hostedUrl'],item['text'],name,region,description,stamp)
+    if kind=='ashby':items,build=client.json(f'https://api.ashbyhq.com/posting-api/job-board/{slug}')['jobs'],_ashby
+    elif kind=='greenhouse':items,build=client.json(f'https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true')['jobs'],_greenhouse
+    else:items,build=client.json(f'https://api.lever.co/v0/postings/{slug}?mode=json'),_lever
+    for item in items:
+        try:job=build(item,name)
+        except (CheckError,KeyError,TypeError,ValueError,AttributeError,OverflowError):
+            if errors is None:raise
+            errors.append(str((item.get('title') or item.get('text') or '?') if isinstance(item,dict) else '?')[:120]);continue
+        if job is not None:yield job
 
 
 class StructuredPage(HTMLParser):
@@ -226,17 +239,18 @@ def page_jobs(client,url):
         if str(item.get('jobLocationType','')).upper()=='TELECOMMUTE':detail+='<p>Remote</p>'
         if names:detail+='<p>Applicants must be located in: '+', '.join(names)+'</p>'
         # Single-job pages often abbreviate JSON-LD. Preserve the actual visible main section too.
-        if len(items)==1 and item.get('title','').casefold() in main_text.casefold() and len(main_text)>len(html_to_text(body)):
+        if len(items)==1 and str(item.get('title') or '').casefold() in main_text.casefold() and len(main_text)>len(html_to_text(body)):
             from html import escape
             body+='<h3>Full visible job page</h3><p>'+escape(main_text).replace('\n','<br>')+'</p>'
-        yield vacancy(item.get('url') or final,item.get('title',''),org.get('name','') if isinstance(org,dict) else str(org),
+        yield vacancy(item.get('url') or final,str(item.get('title') or ''),org.get('name','') if isinstance(org,dict) else str(org),
                       ', '.join(region),detail+body,item.get('datePosted',''),applicant_locations=names)
 
 
 def external_location(job,preferences):
     from preferences import location_fit
     text=job['description_text'];region=job.get('region') or ''
-    country=r'\b(?:Kazakhstan|KZ)\b|Казахстан|Қазақстан'
+    # "KZ" only as a standalone upper-case code: kaspi.kz or hr@kaspi.kz is a domain, not hiring from Kazakhstan.
+    country=r'\bKazakhstan\b|(?<![\w.@/-])(?-i:KZ)(?![\w.])|Казахстан|Қазақстан'
     global_scope=r'\bworldwide\b|work from anywhere|remote anywhere|global(?:ly)? remote|в любой точке мира'
     requirements=job.get('applicant_locations')
     if requirements is None and job.get('location_requirements_json'):
@@ -251,7 +265,9 @@ def external_location(job,preferences):
         r'\b(?-i:US)[ -]?(?:only|based)|only (?:in|within) (?:the )?(?:USA|United States|UK|EU|Europe|Canada|Germany|India)|'
         r'must (?:be|reside|live)[^.\n]{0,70}(?:United States|Canada|UK|EU)|'
         r'remote[^\n.]{0,20}\b(?:USA|United States|Canada|UK|Europe|EU)\b',text,re.I)
-    if restricted and not re.search(country,restricted.group(0),re.I):
+    # The whole clause counts: "Remote (Europe or Kazakhstan)" names Kazakhstan after the matched region.
+    clause=re.match(r'[^\n.;)]*\)?',text[restricted.start():]).group(0) if restricted else ''
+    if restricted and not re.search(country,clause,re.I):
         return 'blocked','Внешняя удалёнка содержит ограничение страны/региона; Казахстан не подтверждён.'
     state,reason=location_fit(job,preferences)
     if state!='remote_review':return state,reason

@@ -83,12 +83,15 @@ def research(job,*,profile_dir,session,key,model,client=None):
                 body=html_to_text(''.join(parser.main)) or html_to_text(html)
                 body=assess.normalize(body)[:6500]
                 if len(body)<150 or not first_party(final,name,body,trusted_domains=trusted):continue
+                # Two links may land on the same page or text (audit A29): keep one source.
+                if any(sources.canonical_url(final)==sources.canonical_url(old['url']) or body==old['text'] for old in result['sources']):continue
                 result['sources'].append({'url':final,'title':name,'retrieved_at':result['retrieved_at'],'text':body})
             except (CheckError,requests.RequestException,ValueError):continue
     finally:
         if owned is not None:owned.close()
     for record in result['sources']:
         for text in assess.fragments(record['text'],'C').values():
+            if any(text==old['text'] for old in result['fragments'].values()):continue
             identity=f"C{len(result['fragments'])+1:03d}"
             result['fragments'][identity]={'text':text,'url':record['url']}
             if len(result['fragments'])>=26:break

@@ -29,10 +29,10 @@ def load_preferences(profile_dir: Path) -> dict | None:
 
 
 def company_is_excluded(job: dict, preferences: dict | None) -> bool:
-    company = " ".join(str(job.get("company") or "").casefold().split())
-    return bool(preferences and company in {
-        " ".join(value.casefold().split()) for value in preferences.get("excluded_companies", [])
-    })
+    # Whole name only, but spaces/punctuation are ignored: web-search ATS links name «Higgsfield AI» «higgsfieldai».
+    def norm(value):return "".join(ch for ch in str(value or "").casefold() if ch.isalnum())
+    company = norm(job.get("company"))
+    return bool(preferences and company and company in {norm(v) for v in preferences.get("excluded_companies", [])})
 
 
 def location_fit(job: dict, preferences: dict) -> tuple[str, str]:
@@ -43,7 +43,7 @@ def location_fit(job: dict, preferences: dict) -> tuple[str, str]:
         return "allowed", f"Офис или удалённая работа в {city} подходят по географии."
     text = str(job.get("description_text") or "")
     remote_denied = re.search(
-        r"удал[её]н\w*[^\n.]{0,70}(?:\bнет\b|не\s+(?:предусмотр|рассматрива|возмож))|"
+        r"удал[её]н\w*[^\n.]{0,70}(?:\bнет\b|не\s*(?:предусмотр|рассматрива|возмож))|без\s+удал[её]н\w*|"
         r"\b(?:not|no)\s+(?:a\s+)?(?:fully\s+)?remote\b|"
         r"\bremote\s+(?:work\s+|working\s+|format\s+)?(?:is\s+)?(?:not\s+(?:available|allowed|offered|permitted)|unavailable)", text, re.I)
     remote_offered = re.search(
@@ -53,7 +53,11 @@ def location_fit(job: dict, preferences: dict) -> tuple[str, str]:
         r"в\s+комфортном\s+офис|(?:только|строго)\s+офф?лайн\s+формат|"
         r"на\s+месте\s+работ[оа]дателя|\bon[- ]?site\b|\boffice\s+(?:work\s+)?only\b|"
         r"\bmust\s+(?:work|be)\s+(?:in|at)\s+(?:the\s+)?office\b", text, re.I)
-    if remote_denied or onsite:
+    # Hybrid outside the office city still means regular office days there — unless full remote is an option.
+    hybrid = re.search(r"гибрид\w*|\bhybrid\b", text, re.I) and not re.search(
+        r"(?:или|либо|\bor\b)\s+(?:полностью\s+|fully\s+|full\s+)?(?:удал[её]нн?\w*|remote)", text, re.I)
+    onsite = onsite or re.search(r"формат\w*\s*:\s*офис", text, re.I)
+    if remote_denied or onsite or hybrid:
         return "blocked", f"За пределами {city} подходит только удалёнка; в описании указан офис или отказ в удалённом формате."
     if remote_offered:
         return "remote_review", f"Удалённый формат указан; доступность работы из {preferences['remote_from']} нужно проверить."

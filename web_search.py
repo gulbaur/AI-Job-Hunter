@@ -45,14 +45,19 @@ def search_query(query,*,session,key,model):
     with response:
         if response.status_code in FATAL_STATUSES:raise SearchConfigurationError(http_error_text('Веб-поиск OpenRouter',response))
         if response.status_code!=200:raise CheckError(http_error_text('Веб-поиск OpenRouter',response))
-        try:body=response.json();message=body['choices'][0]['message'];usage=body.get('usage') or {}
-        except (ValueError,TypeError,KeyError,IndexError):raise CheckError('Веб-поиск вернул некорректный ответ.') from None
-    if usage.get('server_tool_use_details',{}).get('web_search_requests',0)<1:
+        try:
+            body=response.json();message=body['choices'][0]['message'];usage=body.get('usage') or {}
+            if not isinstance(message,dict) or not isinstance(usage,dict):raise TypeError
+        except (ValueError,TypeError,KeyError,IndexError,AttributeError):raise CheckError('Веб-поиск вернул некорректный ответ.') from None
+    details=usage.get('server_tool_use_details') or {}  # may be null (audit A18)
+    searches=details.get('web_search_requests',0) if isinstance(details,dict) else 0
+    if not isinstance(searches,(int,float)) or searches<1:
         raise CheckError('OpenRouter не подтвердил выполнение веб-поиска; ответ модели не используется как выдача.')
     hits=[];seen=set()
     for item in message.get('annotations') or []:
-        if item.get('type')!='url_citation':continue
+        if not isinstance(item,dict) or item.get('type')!='url_citation':continue
         citation=item.get('url_citation') or {}
+        if not isinstance(citation,dict):continue
         try:url=sources.canonical_url(citation.get('url'))
         except CheckError:continue
         if url not in seen:

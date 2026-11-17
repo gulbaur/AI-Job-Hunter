@@ -248,7 +248,23 @@ class AssessTests(unittest.TestCase):
                 guarded = assess.apply_safeguards(optimistic, job)
                 self.assertEqual(guarded["decision"], "stretch")
                 self.assertIn("офис в Астане", guarded["summary"])
+                # Audit A28: the checks come first, but the model's explanation is kept, not thrown away.
+                self.assertTrue(guarded["summary"].startswith("Указан офис в Астане"))
+                self.assertIn("Алматы соответствует локации.", guarded["summary"])
                 self.assertEqual(guarded["gaps"][0]["requirement_quote"], text)
+
+    def test_safeguards_are_idempotent_and_never_exceed_the_summary_limit(self):
+        # Senior review 13.11 (my A28 change): flags were prepended again on every re-read and a long model
+        # summary plus flags failed the 700-character check, rejecting a paid assessment.
+        optimistic = {**copy.deepcopy(RESULT), "decision": "apply", "summary": "Хорошее совпадение. " * 30}
+        job = {**self.job, "description_text": "Опыт работы от 2 лет с Python."}
+        once = assess.apply_safeguards(optimistic, job)
+        twice = assess.apply_safeguards(once, job)
+        self.assertEqual(once["summary"], twice["summary"])
+        self.assertEqual(once["summary"].count("Оценка модели:"), 1)
+        self.assertLessEqual(len(once["summary"]), 700)
+        old_flags_only = {**once, "summary": "Требование стажа выше целевого Junior/Strong Junior; такой стаж нужно подтвердить отдельно по CV."}
+        self.assertNotIn("Оценка модели", assess.apply_safeguards(old_flags_only, job)["summary"])
 
     def test_english_minimum_and_russian_year_range_are_caught(self):
         optimistic = {**copy.deepcopy(RESULT), "decision": "apply"}

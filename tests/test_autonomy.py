@@ -39,6 +39,9 @@ DRAFT={'cv_variant':'ml_engineer','fact_ids':['ML001','ML002'],
     'experience':[{'text':'В работе я оценивала модели классификации изображений с учётом качества разметки и участвовала в развёртывании инференса PyTorch в сервис.',
                    'fact_ids':['ML001','ML002']}],
     'closing':'Буду рада обсудить задачи команды и подробнее рассказать о своём опыте.'}
+# The automatic rewrite after AUDIT_BAD: the unsupported claim is gone.
+REVISED={**DRAFT,'experience':[{'text':'В работе я оценивала модели классификации изображений с учётом качества разметки и работала над подготовкой данных для оценки.',
+                                'fact_ids':['ML001','ML002']}]}
 
 
 AUDIT_OK={'findings':[]}
@@ -87,6 +90,29 @@ class AutonomyTests(unittest.TestCase):
         self.assertIn('HTTP 404',str(caught.exception));self.assertIn('tool_choice',str(caught.exception))
         self.assertNotIn('secret-key-value',str(caught.exception))
 
+    def test_price_cap_error_is_explained_in_plain_russian(self):
+        # 13.11.2026: providers raised the model prices; every request got this English 404 in the Telegram summary.
+        import model_api
+        text='No endpoints found that satisfy the max price for this request.'
+        session=Mock();session.post.return_value=error_response(404,text)
+        with self.assertRaises(CheckError) as caught:
+            web_search.search_query('q',session=session,key='fixture',model='test')
+        self.assertIn('лимит цены',str(caught.exception))
+        session.post.return_value=error_response(404,text)
+        with self.assertRaises(model_api.ModelUnavailable) as caught:
+            model_api.request_json(session,{'model':'m','messages':[]},'fixture',lambda body:body)
+        self.assertIn('лимит цены',str(caught.exception))
+
+    def test_price_cap_admits_cheapest_providers_of_13_11_2026(self):
+        # USD per million tokens from the OpenRouter endpoints list of the model.
+        import assess
+        cap=assess.PRICE_CAP
+        admitted=[name for name,prompt,completion in [('Morph',.04,.60),('Wafer',.051,.567),('River',.12,.48),
+                                                      ('DeepInfra',.14,.42),('Relace',.12,.50)]
+                  if prompt<=cap['prompt'] and completion<=cap['completion']]
+        self.assertGreaterEqual(len(admitted),4)
+        self.assertLessEqual(cap['prompt'],.20);self.assertLessEqual(cap['completion'],.80)
+
     def test_model_request_error_keeps_provider_message(self):
         import model_api
         session=Mock();session.post.return_value=error_response(402,'Insufficient credits')
@@ -128,6 +154,23 @@ class AutonomyTests(unittest.TestCase):
         self.assertNotIn('temperature',audit_payload)
         self.assertEqual(audit_payload['reasoning'],{'effort':'low'})
 
+    def test_paid_letter_survives_crash_between_record_and_letter_file(self):
+        # Audit A35: personalized.json «valid» is written before letter.txt; a crash in between lost the paid letter
+        # and the retry answered «вариант уже отклонён».
+        session=Mock();session.post.side_effect=[response(DRAFT),response(AUDIT_OK)]
+        folder=self.make(session)
+        expected=(folder/'letter.txt').read_text(encoding='utf-8')
+        (folder/'letter.txt').unlink();(folder/'research.json').unlink()
+        self.assertEqual(self.make(session),folder)
+        self.assertTrue((folder/'research.json').is_file())
+        # The real retry path (hunt --retry-key) adds a revision, i.e. a new identity: the valid letter is still reused.
+        (folder/'letter.txt').unlink()
+        retried=self.make(session,{**JOB,'_letter_revision':'20261113T120000Z'})
+        self.assertEqual((retried/'letter.txt').read_text(encoding='utf-8'),expected)
+        self.assertEqual(session.post.call_count,2)
+        self.assertEqual((folder/'letter.txt').read_text(encoding='utf-8'),expected)
+        self.assertEqual(session.post.call_count,2)
+
     def test_invalid_numbers_unknown_company_source_and_fake_motivation_are_rejected(self):
         catalogs=__import__('prepare').fact_catalog(PROFILES)
         for kind in ['number','company','motive']:
@@ -137,14 +180,63 @@ class AutonomyTests(unittest.TestCase):
             if kind=='motive':draft['opening']['text']='Я давно мечтала работать именно у вас.'
             with self.subTest(kind=kind),self.assertRaises(CheckError):personalized.validate(draft,catalogs,{'J001':'Обучать модели.'},{})
 
-    def test_grounding_failure_is_recorded_without_automatic_paid_retry(self):
-        session=Mock();session.post.side_effect=[response(DRAFT),response(AUDIT_BAD)]
+    def test_numbers_in_opening_and_closing_are_checked_too(self):
+        # Audit A5: «3 года production-опыта» in the opening passed; only experience paragraphs were checked.
+        catalogs=__import__('prepare').fact_catalog(PROFILES)
+        for part in ['opening','closing']:
+            draft=copy.deepcopy(DRAFT)
+            if part=='opening':draft['opening']['text']+=' У меня 3 года production-опыта.'
+            else:draft['closing']='Повысила точность на 25% и готова обсудить задачи.'
+            with self.subTest(part=part),self.assertRaises(CheckError):personalized.validate(draft,catalogs,{'J001':'Обучать модели.'},{})
+        # A number taken from the vacancy itself is not a claim about the candidate's record.
+        draft=copy.deepcopy(DRAFT);draft['opening']['text']+=' Интересна задача сократить задержку до 200 мс.'
+        personalized.validate(draft,catalogs,{'J001':'Сократить задержку ответа до 200 мс.'},{})
+
+    def test_finding_whose_own_explanation_says_no_error_does_not_reject(self):
+        letter='Здравствуйте!\n\nДелала проверку логов и ручную оценку ответов чат-бота.\n'
+        quote='Делала проверку логов и ручную оценку ответов чат-бота'
+        # Real Kaspi audit of 09.11.2026: verdict «unsupported», explanation ends «существенной ошибки нет».
+        raw={'findings':[{'quote':quote,'verdict':'unsupported','explanation':'AI013 подтверждает этот факт, но в fact_ids '
+             'письма указаны только AI005, AI008, AI012. Само содержание подтверждено AI013, поэтому существенной ошибки нет.'}]}
+        self.assertEqual(len(personalized.audit_verdict(raw,letter)),1)
+        raw={'findings':[{'quote':quote,'verdict':'unsupported','explanation':'Это допустимое обобщение, ошибки нет; '
+             'однако оценка чат-бота не подтверждена ни одним фактом.'}]}
+        with self.assertRaises(CheckError):personalized.audit_verdict(raw,letter)
+
+    def test_writer_prompt_forbids_the_claims_audits_keep_rejecting(self):
+        prompt=personalized.SYSTEM_PROMPT
+        for phrase in ['важно для компании','это дало понимание','недавно','fact_ids этого абзаца']:
+            self.assertIn(phrase,prompt)
+        self.assertEqual(personalized.VERSION,'personal-letter-v5')
+
+    def test_rejected_letter_is_revised_once_with_the_audit_findings(self):
+        # User decision 10.11.2026: one automatic rewrite after a failed fact check, then a new check.
+        session=Mock();session.post.side_effect=[response(DRAFT),response(AUDIT_BAD),response(REVISED),response(AUDIT_OK)]
+        folder=self.make(session)
+        self.assertEqual(session.post.call_count,4)
+        text=(folder/'letter.txt').read_text(encoding='utf-8')
+        self.assertIn(REVISED['experience'][0]['text'],text);self.assertNotIn('развёртывании инференса',text)
+        rewrite=session.post.call_args_list[2].kwargs['json']['messages']
+        self.assertIn('участвовала в развёртывании инференса PyTorch в сервис',rewrite[-1]['content'])
+        self.assertEqual(rewrite[-2]['role'],'assistant')
+        record=self.last_record()
+        self.assertEqual(record['status'],'valid');self.assertEqual(record['revision']['findings'][0]['quote'],AUDIT_BAD['findings'][0]['quote'])
+
+    def test_revision_rejected_again_is_final_without_more_paid_calls(self):
+        again={'findings':[{'quote':'работала над подготовкой данных для оценки','verdict':'unsupported','explanation':'Нет в CV.'}]}
+        session=Mock();session.post.side_effect=[response(DRAFT),response(AUDIT_BAD),response(REVISED),response(again)]
+        with self.assertRaises(CheckError) as caught:self.make(session)
+        self.assertIn('работала над подготовкой данных',str(caught.exception))
         with self.assertRaises(CheckError):self.make(session)
-        with self.assertRaises(CheckError):self.make(session)
-        self.assertEqual(session.post.call_count,2)
+        self.assertEqual(session.post.call_count,4)
         self.assertEqual(list(self.root.rglob('letter.txt')),[])
-        record=json.loads(next(self.root.rglob('personalized.json')).read_text(encoding='utf-8'))
-        self.assertEqual(record['status'],'rejected')
+        self.assertEqual(self.last_record()['status'],'rejected')
+
+    def test_outage_during_rewrite_keeps_the_rejection_not_a_retryable_failure(self):
+        import requests
+        session=Mock();session.post.side_effect=[response(DRAFT),response(AUDIT_BAD),requests.ConnectionError('down')]
+        with self.assertRaises(CheckError):self.make(session)
+        self.assertEqual(self.last_record()['status'],'rejected')
 
     def last_record(self):
         return json.loads(max(self.root.rglob('personalized.json'),key=lambda p:p.stat().st_mtime).read_text(encoding='utf-8'))
@@ -159,7 +251,7 @@ class AutonomyTests(unittest.TestCase):
         self.assertEqual(self.last_record()['status'],'valid')
 
     def test_unsupported_claim_quoted_from_letter_rejects_it(self):
-        session=Mock();session.post.side_effect=[response(DRAFT),response(AUDIT_BAD)]
+        session=Mock();session.post.side_effect=[response(DRAFT),response(AUDIT_BAD),response(DRAFT),response(AUDIT_BAD)]
         with self.assertRaises(CheckError) as caught:self.make(session)
         self.assertIn('участвовала в развёртывании инференса PyTorch',str(caught.exception))
         record=self.last_record()

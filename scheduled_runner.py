@@ -24,6 +24,9 @@ def main():
     with path.open('w',encoding='utf-8') as output,contextlib.redirect_stdout(output),contextlib.redirect_stderr(output):
         output.reconfigure(line_buffering=True)
         try:
+            import common
+            try:common.daily_backup(ROOT/'data/jobs.sqlite',ROOT/'data/backups')
+            except Exception as exc:print(f'Резервная копия базы не создана: {type(exc).__name__}.',flush=True)
             import scheduled_run
             print('Autonomous Windows scheduler entry point.',flush=True)
             # Waiting is allowed only before processing has actually begun.
@@ -31,6 +34,9 @@ def main():
                 code=scheduled_run.main()
                 if code!=75 or attempt==120:break
                 time.sleep(30)
+        except SystemExit as exc:
+            # e.g. parser.error() on invalid settings (audit A19): still record the call and notify.
+            traceback.print_exc();code=exc.code if isinstance(exc.code,int) else 1
         except Exception:
             traceback.print_exc();code=1
     state={}
@@ -51,7 +57,13 @@ def main():
         problem_state={'state':'stopped','error':'Не удалось запустить плановую подготовку. Подробности — в журнале приложения.'}
     signature=run_status.fingerprint(problem_state)
     new_problem=bool(signature and signature!=notice.get('last_failure'))
-    if (prepared or new_problem) and sys.platform=='win32':
+    import telegram_events
+    if telegram_events.configured(ROOT):
+        # Letters and search status arrive as the run's Telegram summary and cards (hunt.py);
+        # here only run-level failures that the summary cannot carry: lost window, crash, stop.
+        run_level=code!=0 or problem_state.get('state') in {'stopped','interrupted','started'}
+        if new_problem and run_level:telegram_events.problem(ROOT/'data/jobs.sqlite',run_status.problem(problem_state),signature)
+    elif (prepared or new_problem) and sys.platform=='win32':
         args=['powershell.exe','-NoProfile','-File',str(ROOT/'tools/notify_ready.ps1'),'-Count',str(min(prepared,10))]
         if new_problem:args.append('-Problem')
         subprocess.Popen(args,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))

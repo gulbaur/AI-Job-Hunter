@@ -208,6 +208,129 @@ print('Browser and SQLite CLI: API-independent imports OK')
                       "Инженер машинного обучения", "Computer Vision Engineer"]:
             self.assertTrue(browser.title_is_relevant(title), title)
 
+    # Real hh.kz titles of 10.11.2026 that the old title-only queries never fetched.
+    MISSED_TARGETS = ["AI/ML-разработчик (Python)/Стажер", "AI/ML специалист", "AI Agent Developer",
+                      "Специалист по разработке, настройке и внедрению ИИ-агентов", "Специалист по нейросетям",
+                      "Специалист по прикладному ИИ / Applied AI Specialis", "Специалист по исследованию ИИ",
+                      "Digital Engineer (AI-разработка и автоматизация бизнес-процессов)", "AI-интегратор",
+                      "Forward Deployed Engineer (Python / AI) — KOZ AI", "ML-инженер", "Инженер по видеоаналитике (Computer Vision)"]
+    # Real titles a broad "AI" query also returns; none is an engineering role, each would cost a paid assessment.
+    AI_NOISE = ["Креативный интернет-маркетолог (ИИ-контент и AI-видео)", "AI-креатор", "Монтажер ИИ креатор",
+                "Менеджер по продажам B2B / назначению встреч (AI-маркетинг)", "Finance Manager (AI-First)",
+                "Юрист по международному праву (AI-First)", "Solution Sales Manager (Data & AI)", "AI Content Assistant",
+                "GEO / AI SEO-специалист (продвижение в ChatGPT, Gemini, Perplexity)", "AI-специалист (AI Search / GEO)",
+                "Дизайнер визуального контента (Photoshop, AI) - Алматы", "Преподаватель IT/AI для детей и взрослых",
+                "Учитель информатики / Тренер по робототехнике / Специалист ИИ", "AI Creative Designer (Media Buying)",
+                "Контент-креатор для AI-стартапов (видео в кадре, Reels / TikTok / Shorts)", "Креативщик UGC / AI-видеомейкер",
+                "Shopify-специалист по созданию и развитию интернет-магазинов (AI / SEO / E-commerce)",
+                "Специалист технической поддержки AI-сервисов", "Оператор ИИ-агентов (Claude Code) / технический ассистент",
+                "Экономист по труду и заработной плате (с навыками применения ИИ)", "SMM-специалист (контент, ИИ)",
+                "ИИ-методолог (AI Methodologist)", "Game Designer / AI Game Builder", "Software QA Engineer/Intern (AI-Powered)",
+                "Digital Marketing Specialist / Performance Marketer (AI-Native)", "AI оқу контентін әзірлеуші (Қазақ тілі пәні)",
+                "Спикер лектор курса \"AI creator\"", "Ассистент руководителя (автоматизация процессов и ИИ, Битрикс24)"]
+
+    def test_title_filter_keeps_missed_engineering_titles_and_drops_ai_noise(self):
+        for title in self.MISSED_TARGETS:
+            self.assertTrue(browser.title_is_relevant(title), title)
+        for title in self.AI_NOISE:
+            self.assertFalse(browser.title_is_relevant(title), title)
+
+    def test_archived_vacancy_answered_with_200_is_closed(self):
+        # hh.kz/vacancy/138879721 (Parametric) on 10.11.2026: HTTP 200, full description, banner in the title.
+        archived = FIXTURE.replace('<h1 data-qa="vacancy-title">ML Engineer</h1>',
+            '<h1 data-qa="vacancy-title"><span>ML Engineer</span><div data-qa="vacancy-title-archived-text">'
+            'В&nbsp;архиве с <time datetime="2026-11-06T10:23:36.886Z">6 ноября 2026</time></div></h1>')
+        self.page.set_content(archived)
+        with self.assertRaises(browser.VacancyClosed):
+            browser.read_vacancy(self.page, "111", "https://hh.kz/vacancy/111")
+        self.page.set_content(FIXTURE)
+        self.assertEqual(browser.read_vacancy(self.page, "111", "https://hh.kz/vacancy/111")["name"], "ML Engineer")
+
+    def test_archived_vacancy_without_description_is_closed_not_a_read_error(self):
+        # Same Parametric page on 13.11.2026: HH dropped the description, only the archive banner is left.
+        archived = FIXTURE.replace('<h1 data-qa="vacancy-title">ML Engineer</h1>',
+            '<h1 data-qa="vacancy-title"><span>ML Engineer</span><div data-qa="vacancy-title-archived-text">'
+            'В&nbsp;архиве с 6 ноября 2026</div></h1>')
+        archived = archived.replace('<div data-qa="vacancy-description"><p>Full &amp; complete</p><p>Python and ML.</p></div>', '')
+        self.page.set_content(archived)
+        with self.assertRaises(browser.VacancyClosed):
+            browser.read_vacancy(self.page, "111", "https://hh.kz/vacancy/111")
+
+    def test_archived_vacancy_with_hidden_description_is_closed(self):
+        # hh.kz/vacancy/138663959 (Bereke Bank) on 17.11.2026: no title banner; «Вакансия в архиве» block above a
+        # collapsed («Показать описание вакансии») description. Read as a read error, it was never archived.
+        archived = FIXTURE.replace('<div data-qa="vacancy-description">',
+            '<h2>Вакансия в архиве</h2><div data-qa="vacancy-archive-description">Работодатель, вероятно, уже нашел '
+            'нужного кандидата</div><div data-qa="vacancy-description" style="display:none">')
+        self.page.set_content(archived)
+        with self.assertRaises(browser.VacancyClosed):
+            browser.read_vacancy(self.page, "111", "https://hh.kz/vacancy/111")
+
+    def test_login_is_verified_on_the_resumes_page(self):
+        # Audit A25: «Сессия HH сохранена» was printed without checking that HH accepts the session.
+        def logged_out(route):
+            if '/applicant/resumes' in route.request.url:
+                route.fulfill(status=302,headers={'Location':'https://hh.kz/account/login?backurl=%2Fapplicant%2Fresumes'})
+            else:route.fulfill(status=200,content_type='text/html',body='<form>Вход</form>')
+        context=self.browser.new_context();self.addCleanup(context.close)
+        context.route('**/*',logged_out)
+        self.assertFalse(browser.verify_login(context))
+        context=self.browser.new_context();self.addCleanup(context.close)
+        context.route('**/*',lambda route:route.fulfill(status=200,content_type='text/html',body='<h1>Мои резюме</h1>'))
+        self.assertTrue(browser.verify_login(context))
+        # A captcha or a network failure is not «logged out»: the real reason is reported (review 13.11, finding 12).
+        context=self.browser.new_context();self.addCleanup(context.close)
+        context.route('**/*',lambda route:route.fulfill(status=200,content_type='text/html',body='<div data-qa="captcha">x</div>'))
+        with self.assertRaises(browser.BrowserStop) as caught:browser.verify_login(context)
+        self.assertIn('капч',str(caught.exception))
+
+    def test_target_titles_named_in_the_search_profiles_are_relevant(self):
+        # Senior review 13.11 (pipeline 7): HH was searched for these, then the cards were thrown away.
+        for title in ["Junior Data Science Engineer","Стажёр Data Science","Специалист по Data Science",
+                      "GenAI Engineer","Junior GenAI Developer","RAG Engineer"]:
+            self.assertTrue(browser.title_is_relevant(title),title)
+        for title in ["Senior Data Science Engineer","GenAI Marketing Manager","Менеджер по продажам RAG"]:
+            self.assertFalse(browser.title_is_relevant(title),title)
+
+    def test_one_unreachable_vacancy_page_is_skipped_not_fatal(self):
+        # Senior review 13.11 (pipeline 4): a timeout/5xx on one direct HH link raised BrowserStop and stopped
+        # every HH search; the link stayed pending and blocked the next run too.
+        counts={'saved':0,'added':0,'errors':0,'skipped':0,'known':0}
+        def unreachable(page,url,stage):raise browser.PageUnavailable('Таймаут')
+        with patch.object(browser,'navigate',side_effect=unreachable),JobStore(Path(tempfile.mkdtemp())/'j.sqlite') as store:
+            browser.collect_links(self.page,store,[('7','https://hh.kz/vacancy/7')],limit=5,refresh=False,counts=counts,
+                                  seen=set(),preferences=None,settings=None)
+        self.assertEqual(counts['error_ids'],['7'])
+        def blocked(page,url,stage):raise browser.BrowserStop('HH показывает капчу.')
+        with patch.object(browser,'navigate',side_effect=blocked),JobStore(Path(tempfile.mkdtemp())/'j.sqlite') as store, \
+             self.assertRaises(browser.BrowserStop):
+            browser.collect_links(self.page,store,[('8','https://hh.kz/vacancy/8')],limit=5,refresh=False,counts=counts,
+                                  seen=set(),preferences=None,settings=None)
+
+    def test_noise_words_do_not_drop_engineering_titles_on_company_boards(self):
+        for title in ["ML Engineer, Content Understanding", "Machine Learning Engineer — Marketplace Ranking",
+                      "AI Engineer, Customer Support Automation", "Generative AI Engineer (Creative Tools)",
+                      "LLM Research Scientist, Multimodal Content", "Разработчик ИИ для маркетплейса"]:
+            self.assertTrue(browser.title_is_relevant(title), title)
+        for title in ["Software QA Engineer/Intern (AI-Powered)", "Sales Engineer (AI)"]:
+            self.assertFalse(browser.title_is_relevant(title), title)
+
+    def test_hh_queries_ask_for_standalone_ai_ml_and_neural_titles(self):
+        texts = [parse_qs(urlsplit(url).query)["text"][0] for _, url in browser.search_plan(junior=True, expanded=True, pages=1)]
+        joined = " ".join(texts)
+        for term in ["AI OR", "ML OR", "ИИ", "нейросет*"]:
+            self.assertIn(term, joined, term)
+        self.assertIn("AI", texts[0])  # entry-level query covers the same roles
+        # Broad AI queries exclude marketing/content/sales on HH itself: on 10.11.2026 noise filled both
+        # pages (60 results) and pushed real roles out; with NOT 27 results kept all 21 relevant titles.
+        for text in (texts[0], texts[2]):
+            self.assertIn(" NOT (", text)
+            excluded = text.split(" NOT (", 1)[1]
+            for word in ["маркет*", "контент*", "продаж*", "менеджер*"]:
+                self.assertIn(word, excluded)
+            for word in ["engineer", "инженер", "разработчик", "developer"]:
+                self.assertNotIn(word, excluded.casefold())
+
     def test_reuse_session_does_not_request_input_or_bypass_login_blocker(self):
         launcher = SimpleNamespace(chromium=SimpleNamespace(launch_persistent_context=lambda **kwargs: self.context))
         def navigate(page, url, stage):

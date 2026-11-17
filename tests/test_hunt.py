@@ -20,7 +20,7 @@ EN={'ml_engineer':'Evaluated image classification models with PyTorch.',
 RU='Разрабатывала FastAPI-эндпоинты и JSON-схемы для сервиса заявок.\nДорабатывала RAG-поиск по документации с индексами SQLite и кэшем эмбеддингов.'
 
 
-def vacancy(identity='1',company='Example',region='Алматы',description='Python and FastAPI.'):
+def vacancy(identity='1',company='Example',region='Алматы',description='Нужен опыт с Python и FastAPI.'):
     return {'id':identity,'name':'AI Engineer (LLM)','employer':{'name':company},'area':{'name':region},
             'alternate_url':f'https://hh.kz/vacancy/{identity}','description':description,'published_at':'2026-10-22'}
 
@@ -64,15 +64,45 @@ class HuntTests(unittest.TestCase):
     def test_total_budget_covers_both_stages_and_failed_requests(self):
         payload={'max_tokens':300,'provider':{'max_price':assess.PRICE_CAP},'messages':[]}
         raw=Mock();raw.post.return_value=response({})
-        session=hunt.BudgetSession(raw,.0002)
+        session=hunt.BudgetSession(raw,.0005)  # one worst-case reserve under PRICE_CAP fits, two do not
         session.post('https://openrouter.ai/api/v1/chat/completions',json=payload)
         with self.assertRaises(CheckError):session.post('https://openrouter.ai/api/v1/chat/completions',json=payload)
         self.assertEqual(raw.post.call_count,1)
         raw.post.side_effect=requests.Timeout('synthetic')
         session=hunt.BudgetSession(raw,.02)
         with self.assertRaises(requests.Timeout):session.post('https://openrouter.ai/api/v1/chat/completions',json=payload)
-        self.assertEqual(session.summary()['unknown_cost_calls'],1)
+        self.assertEqual(session.summary()['failed_calls'],1)  # no answer: failed, not «unknown cost» (A17)
         self.assertEqual(session.calls,1)
+
+    def test_failed_calls_are_counted_apart_from_paid_ones(self):
+        # Audit A17: six 404 answers were reported as «6 запросов с неизвестной стоимостью».
+        payload={'max_tokens':300,'provider':{'max_price':assess.PRICE_CAP},'messages':[]}
+        failed=requests.Response();failed.status_code=404;failed._content=b'{"error":{"message":"x"}}';failed._content_consumed=True
+        raw=Mock();raw.post.side_effect=[failed,response({}),requests.Timeout('synthetic')]
+        session=hunt.BudgetSession(raw,1.0)
+        session.post('https://openrouter.ai/api/v1/chat/completions',json=payload)
+        session.post('https://openrouter.ai/api/v1/chat/completions',json=payload)
+        with self.assertRaises(requests.Timeout):session.post('https://openrouter.ai/api/v1/chat/completions',json=payload)
+        summary=session.summary()
+        self.assertEqual((summary['calls'],summary['succeeded_calls'],summary['failed_calls'],summary['unknown_cost_calls']),(3,1,2,0))
+        self.assertGreater(summary['known_cost_usd'],0)
+        text=hunt.usage_text(summary)
+        self.assertIn('успешных 1',text);self.assertIn('неудачных 2',text);self.assertIn('резерв',text)
+
+    def test_model_outage_returns_jobs_to_the_queue_and_stops_the_batch(self):
+        # Senior review 13.11 (pipeline 6): the 404 «max price» outage left every job «assessment_failed»,
+        # excluded from later runs until the user retried each one by hand; the batch kept calling the model.
+        import model_api,work_queue
+        self.store.save(vacancy('2'))
+        jobs=hunt.eligible(self.store,PREF)
+        with patch.object(hunt.assess,'load_profiles',return_value={}), \
+             patch.object(hunt.assess,'assess_jobs',side_effect=model_api.ModelUnavailable('OpenRouter: HTTP 404 — max price')) as calls, \
+             contextlib.redirect_stdout(io.StringIO()):
+            hunt.prepare_batch(self.store,jobs,model='test',profile_dir=self.profile,output=self.root/'run',
+                               session=Mock(),run=True,budget=1,preferences=PREF,key='k')
+        self.assertEqual(calls.call_count,1)
+        self.assertEqual(work_queue.retry_required(self.store),set())
+        self.assertEqual(len(hunt.eligible(self.store,PREF)),2)
 
     def test_filters_apply_before_limit_or_model_and_empty_scope_stays_empty(self):
         self.store.save(vacancy('2','Kaspi.kz'))
@@ -143,6 +173,76 @@ class HuntTests(unittest.TestCase):
                 hh_response.response_url('https://hh.kz/vacancy/1',href,'1')
         self.assertIn('almaty.hh.kz',hh_response.response_url('https://almaty.hh.kz/vacancy/1',
                       '/applicant/vacancy_response?vacancyId=1','1'))
+
+
+class DuplicateOpportunityTests(unittest.TestCase):
+    # Live 10.11.2026: G2i «AI Engineer  LLM Engineer -  Talent Pool» was posted twice on tryremotely.com
+    # (different URL and text); the second copy got a second paid letter.
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.store=JobStore(Path(self.temp.name)/'jobs.sqlite');self.addCleanup(self.store.connection.close)
+
+    def add(self,identity,title,company='Example',region='Алматы',source='hh'):
+        job={**vacancy(identity,company=company,region=region),'name':title}
+        if source=='web':job.update(alternate_url=f'https://jobs.example.com/{identity}',description='Remote. Worldwide. Python и FastAPI.')
+        self.store.save(job,source=source)
+        self.store.connection.execute("UPDATE jobs SET first_seen_at=? WHERE vacancy_id=?",(f'2026-11-0{identity}T00:00:00+00:00',identity))
+        self.store.connection.commit()
+
+    def ids(self):return [j['vacancy_id'] for j in hunt.eligible(self.store,PREF,limit=10)]
+
+    def drafted(self,identity,source='hh'):
+        import draft_queue
+        draft_queue.ensure(self.store.connection)
+        self.store.connection.execute('INSERT INTO draft_queue(source,vacancy_id,packet_path) VALUES (?,?,?)',(source,identity,'x'))
+        self.store.connection.commit()
+
+    def test_repost_of_opportunity_in_work_is_not_prepared_again(self):
+        self.add('1','AI Engineer  LLM Engineer -  Talent Pool','G2i','',source='web')
+        self.add('2','AI Engineer LLM Engineer - Talent Pool','g2i','',source='web')
+        self.add('3','ML Engineer (LLM)','ТОО «Example»')
+        self.add('4','ML engineer (LLM)','Example')  # HH repost by the same employer, same text
+        self.assertEqual(sorted(self.ids()),['1','2','3','4'])  # nothing in work yet: one batch may hold both
+        self.drafted('1','web');self.drafted('3')
+        self.assertEqual(sorted(self.ids()),['1','3'])
+        self.drafted('4')  # a copy that already has its own letter stays visible
+        self.assertEqual(sorted(self.ids()),['1','3','4'])
+
+    def test_same_hh_title_with_different_text_is_another_team(self):
+        self.add('1','ML Engineer');self.drafted('1')
+        job={**vacancy('2',description='Команда рекомендаций: ранжирование товаров, CatBoost, A/B тесты, ClickHouse.'),'name':'ML Engineer'}
+        self.store.save(job)
+        self.assertEqual(sorted(self.ids()),['1','2'])
+
+    def test_other_place_or_reopened_after_archive_is_a_new_opportunity(self):
+        self.add('1','AI Engineer (LLM)',region='Алматы');self.drafted('1')
+        self.add('2','AI Engineer (LLM)',region='Алматы, Абая 26')
+        self.assertEqual(sorted(self.ids()),['1','2'])
+        self.store.connection.execute("UPDATE jobs SET status='archived' WHERE vacancy_id='1'");self.store.connection.commit()
+        self.add('3','AI Engineer (LLM)',region='Алматы')
+        self.assertEqual(sorted(self.ids()),['2','3'])
+
+    def test_repost_of_rejected_or_applied_vacancy_stays_out(self):
+        self.add('1','AI Engineer (LLM)');self.add('2','AI Engineer (LLM)')
+        for status in ('skipped','applied'):
+            self.store.connection.execute("UPDATE jobs SET status=? WHERE vacancy_id='1'",(status,));self.store.connection.commit()
+            self.assertEqual(self.ids(),[],status)
+
+
+class LetterLanguageTests(unittest.TestCase):
+    # Audit A31: hh.kz/vacancy/137726330 is entirely in English but got a Russian letter and Russian CV.
+    def test_english_hh_vacancy_gets_english_letter(self):
+        text = "We are looking for a Data Scientist to join our team in Almaty. Python, SQL, ML models in production."
+        self.assertEqual(hunt.letter_language({'source': 'hh', 'description_text': text}), 'en')
+
+    def test_russian_text_with_many_tech_terms_stays_russian(self):
+        text = "Опыт работы с Python, PyTorch, LLM, RAG, Docker и Kubernetes. Задачи: разработка ML-сервисов, A/B тесты."
+        for source in ('hh', 'web'):
+            self.assertEqual(hunt.letter_language({'source': source, 'description_text': text}), 'ru')
+
+    def test_english_page_with_a_russian_word_stays_english(self):
+        text = "AI Engineer Intern. Location: Алматы. Build LLM agents and evaluation pipelines with our research team."
+        self.assertEqual(hunt.letter_language({'source': 'web', 'description_text': text}), 'en')
 
 
 class HHBrowserTests(unittest.TestCase):

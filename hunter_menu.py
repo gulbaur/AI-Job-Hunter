@@ -48,7 +48,7 @@ def show_packet(packet):
 def pending_entries(unread_only=False):
     with JobStore() as store:
         draft_queue.import_existing(store.connection, ROOT)
-        return draft_queue.pending(store, load_preferences(ROOT/'profile'),search_settings.load(ROOT/'profile'),unread_only=unread_only)
+        return draft_queue.pending(store, load_preferences(ROOT/'profile'),search_settings.load(ROOT/'profile'),unread_only=unread_only,root=ROOT)
 
 
 def review(read=input, quiet=False, include_viewed=False):
@@ -82,8 +82,7 @@ def review(read=input, quiet=False, include_viewed=False):
                         webbrowser.open(canonical_url(packet['url']))
                         print('Открыта ссылка. Программа не вводила данные и не отправляла отклик.')
                     elif ask(f"Если уже отправили вручную, введите ОТПРАВЛЕНО {packet['vacancy_id']}: ",read)==f"ОТПРАВЛЕНО {packet['vacancy_id']}":
-                        from hh_response import SCHEMA
-                        from apply import now
+                        from hh_response import SCHEMA,now
                         with hunt.one_run(ROOT/'profile/hunt.lock'),JobStore() as store:
                             store.connection.executescript(SCHEMA)
                             with store.connection:
@@ -98,8 +97,16 @@ def review(read=input, quiet=False, include_viewed=False):
                 print('Проверка завершена.' if code==0 else 'Действие остановлено; смотрите причину выше. Черновики сохранены.')
                 break
             if action=='р':
-                subprocess.Popen(['notepad.exe',str(Path(packet['letter_path']).resolve())])
+                letter_file=Path(packet['letter_path']).resolve()
+                before=letter_file.read_bytes() if letter_file.is_file() else b''
+                subprocess.Popen(['notepad.exe',str(letter_file)])
                 ask('Отредактируйте письмо в Блокноте, сохраните файл и нажмите здесь Enter: ',read)
+                if letter_file.is_file() and letter_file.read_bytes()!=before:
+                    # The text is now the user's, not the checked one (senior review 13.11, web 10).
+                    from datetime import datetime,timezone
+                    with hunt.one_run(ROOT/'profile'/'hunt.lock'),JobStore() as store,store.connection:
+                        store.connection.execute('UPDATE draft_queue SET edited_by_user_at=? WHERE source=? AND vacancy_id=?',
+                            (datetime.now(timezone.utc).isoformat(),packet['source'],packet['vacancy_id']))
             elif action=='и':
                 with hunt.one_run(ROOT/'profile'/'hunt.lock'), JobStore() as store:
                     with store.connection:
@@ -146,15 +153,17 @@ def history():
 
 def login(read=input):
     from playwright.sync_api import sync_playwright
-    from browser_check import PROFILE_DIR, navigate, check_blocker
+    from browser_check import PROFILE_DIR, navigate, verify_login
     with hunt.one_run(ROOT/'profile'/'hunt.lock'), sync_playwright() as p:
         context=p.chromium.launch_persistent_context(str(PROFILE_DIR),headless=False)
         try:
             page=context.new_page()
             navigate(page,'https://hh.kz/','HH для ручного входа')
             ask('Войдите в HH самостоятельно в открытом окне. После завершения нажмите Enter здесь: ',read)
-            check_blocker(page)
-            print('Окно закрывается; сессия сохранена. Если при поиске снова потребуется вход, повторите этот пункт.')
+            if verify_login(context):
+                print('Вход в HH проверен и сохранён. Окно закрывается.')
+            else:
+                print('Вход не подтверждён: HH всё ещё просит войти. Повторите этот пункт и войдите полностью.')
         finally:
             context.close()
 

@@ -1,0 +1,39 @@
+# Local settings and secrets
+.env
+.env.*
+!.env.example
+
+# Virtual environments and Python cache
+.venv/
+__pycache__/
+*.py[cod]
+
+# Project browser profiles contain private login sessions
+/profile/
+/drafts/
+/data/last_browser_run.json
+/data/last_browser_run.tmp
+/data/last_hunt_run.json
+/data/last_hunt_packet.json
+/data/last_scheduled_run.json
+/data/web_discovery.json
+/data/last_discovery.json
+/data/discovery_reports/
+
+# Local databases, journals and SQLite auxiliary files
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db3
+*.db3-*
+
+# Personal runtime data, reports, backups and scratch files (never published)
+/data/
+/tmp/
+/output/
+/ml-path/
+*.zip
+*.lock

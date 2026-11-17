@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import requests
 import sys
 import tempfile
 import unittest
@@ -32,8 +33,18 @@ from test_prepare import PROFILES,JOB,ASSESSMENT
 
 
 class ResilienceTests(unittest.TestCase):
+    def test_hh_sending_does_not_depend_on_mad_devs_pilot(self):
+        # Audit A38: hh_response imported SCHEMA/now from an archived site-form pilot that could send contacts and CV.
+        root=Path(__file__).resolve().parents[1]
+        code="import sys,hh_response,hunter_menu,telegram_bot; print('apply' in sys.modules)"
+        result=subprocess.run([sys.executable,'-B','-c',code],cwd=root,capture_output=True,text=True,timeout=60)
+        self.assertEqual(result.stdout.strip(),'False',result.stderr[-500:])
+
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        # Other tests run code that does load_dotenv(real .env); a paired real bot must not leak into these.
+        env=patch.dict(os.environ);env.start();self.addCleanup(env.stop)
+        for name in ('TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID'):os.environ.pop(name,None)
         self.root=Path(self.temp.name);self.profile=self.root/'profile';self.profile.mkdir()
         self.db=self.root/'jobs.sqlite'
         (self.profile/'preferences.json').write_text(json.dumps(PREF),encoding='utf-8')
@@ -91,6 +102,21 @@ class ResilienceTests(unittest.TestCase):
             self.assertEqual(store.get('1')['status'],'archived')
             self.assertEqual([j['vacancy_id'] for j in hunt.eligible(store,PREF)],['2'])
 
+    def test_browser_stop_returns_unrefreshed_jobs_to_next_run_not_to_manual_retry(self):
+        # Audit A12: a closed Chromium window or lost network sent the whole queue to a manual paid retry.
+        from playwright.sync_api import Error as PlaywrightError
+        with JobStore(self.db) as store:
+            store.save(vacancy('1'));store.save(vacancy('2'))
+            jobs=[dict(store.get('1')),dict(store.get('2'))]
+            p=Mock();p.__enter__=Mock(return_value=p);p.__exit__=Mock(return_value=False)
+            p.chromium.launch_persistent_context.side_effect=PlaywrightError('Target page, context or browser has been closed')
+            with patch('browser_check.sync_playwright',return_value=p):
+                outcome=browser_check.refresh_saved(store,jobs)
+            self.assertEqual(sorted(outcome['failed']),[('hh','1'),('hh','2')])  # skipped in this run
+            self.assertEqual(work_queue.retry_required(store),set())
+            self.assertEqual(work_queue.issues(store,PREF,search_settings.load(self.profile)),[])
+            self.assertEqual(sorted(j['vacancy_id'] for j in hunt.eligible(store,PREF)),['1','2'])
+
     def test_unreadable_job_is_exposed_but_does_not_stop_other_refreshes(self):
         with JobStore(self.db) as store:
             store.save(vacancy('1'));store.save(vacancy('2'))
@@ -135,6 +161,18 @@ class ResilienceTests(unittest.TestCase):
             self.assertEqual(sources.external_location(dict(store.get(item['id'],'web')),PREF)[0],'blocked')
         self.assertEqual(sources.external_location({**job,'description_text':'Remote worldwide. Work with us.'},PREF)[0],'remote_review')
 
+    def test_company_page_reached_by_two_links_is_one_source(self):
+        # Audit A29: kaspi.kz/ and a search hit both redirected to kaspi.kz/kz — the same text went in twice.
+        body='<main>'+'<p>Kaspi.kz строит финтех и маркетплейс; команда развивает AI-продукты для миллионов клиентов.</p>'*4+'</main>'
+        client=Mock();client.page.return_value=('https://kaspi.kz/kz',body)
+        found={'hits':[{'url':'https://kaspi.kz/kz'}],'cached':False}
+        with patch('company_research.cached_query',return_value=found):
+            result=company_research.research({'company':'Kaspi.kz','url':'https://hh.kz/vacancy/1','source':'hh'},
+                profile_dir=self.profile,session=Mock(),key='k',model='m',client=client)
+        self.assertEqual(len(result['sources']),1)
+        texts=[f['text'] for f in result['fragments'].values()]
+        self.assertEqual(len(texts),len(set(texts)))
+
     def test_generic_domain_and_wrong_brand_content_are_not_company_sources(self):
         self.assertFalse(company_research.first_party('https://technologies.example/about','Dreamlab Technologies Ltd','Other company'))
         self.assertFalse(company_research.first_party('https://credit.example','Home Credit Bank','Home Credit'))
@@ -160,6 +198,25 @@ class ResilienceTests(unittest.TestCase):
             browser.assert_not_called()
             self.assertEqual(store.connection.execute("SELECT state FROM discovered_links WHERE url LIKE '%/2'").fetchone()[0],'manual_link')
 
+    def test_web_hh_links_are_read_once_and_never_loop(self):
+        # Audit A22: a link skipped by the title filter stayed hh_pending and was reopened every run;
+        # a checked link went back to hh_pending whenever web search listed it again.
+        config={'enabled':['hh','web'],'boards':[],'career_pages':[],'max_web_links':30}
+        manifest=self.root/'browser.json';opened=[]
+        links=[{'url':'https://hh.kz/vacancy/1'},{'url':'https://hh.kz/vacancy/5'}]
+        with JobStore(self.db) as store:
+            def collect_hh(*args,**kwargs):
+                opened.append(sorted(kwargs['vacancy_urls']))
+                if 'https://hh.kz/vacancy/1' in kwargs['vacancy_urls']:store.save(vacancy())
+                manifest.write_text(json.dumps({'vacancy_ids':[],'saved':0,'errors':0,'skipped_ids':['5']}))
+                return 0
+            for _ in range(2):
+                with patch('discovery.web_input',return_value=(links,[],'fresh')),                      patch('browser_check.run',side_effect=collect_hh),patch.object(browser_check,'RUN_MANIFEST',manifest):
+                    discovery.collect(store,search_settings.validate({}),PREF,config=config,client=Mock(),report_path=self.root/'report.json')
+            states=dict(store.connection.execute('SELECT url,state FROM discovered_links'))
+        self.assertEqual(opened,[['https://hh.kz/vacancy/1','https://hh.kz/vacancy/5'],[]])
+        self.assertEqual(states,{'https://hh.kz/vacancy/1':'hh_checked','https://hh.kz/vacancy/5':'hh_skipped'})
+
     def test_transient_personal_letter_error_is_not_recorded_as_factual_rejection(self):
         unavailable=response({});unavailable.status_code=503
         session=Mock();session.post.return_value=unavailable
@@ -182,6 +239,76 @@ class ResilienceTests(unittest.TestCase):
              patch('scheduled_runner.time.sleep') as wait,patch('subprocess.Popen'):
             scheduled_runner.main()
             self.assertEqual(run.call_count,2);wait.assert_called_once_with(30)
+
+    def test_invalid_settings_exit_is_recorded_and_notified(self):
+        # Audit A19: SystemExit from parser.error() bypassed the runner: no invocation record, no notice.
+        data=self.root/'data';data.mkdir()
+        with patch.object(scheduled_runner,'ROOT',self.root),patch('scheduled_run.main',side_effect=SystemExit(2)),              patch('subprocess.Popen') as notify:
+            self.assertEqual(scheduled_runner.main(),2)
+        self.assertEqual(json.loads((data/'last_scheduler_invocation.json').read_text(encoding='utf-8'))['exit_code'],2)
+        self.assertTrue(notify.called)
+
+    def test_report_replace_retries_while_file_is_briefly_locked(self):
+        # Audit A20: os.replace fails with WinError 5 while the UI or antivirus reads the JSON.
+        import common
+        real=os.replace;calls=[0]
+        def flaky(src,dst):
+            calls[0]+=1
+            if calls[0]<3:raise PermissionError(5,'Access is denied')
+            return real(src,dst)
+        with patch('os.replace',side_effect=flaky),patch('time.sleep'):
+            common.write_json(self.root/'r.json',{'ok':1})
+        self.assertEqual(json.loads((self.root/'r.json').read_text(encoding='utf-8')),{'ok':1})
+
+    def test_odd_web_search_answer_never_stops_hh_and_boards(self):
+        # Audit A18: `server_tool_use_details: null` or a non-dict annotation crashed the whole collection.
+        import web_search
+        odd=requests.Response();odd.status_code=200;odd._content_consumed=True
+        odd._content=json.dumps({'choices':[{'message':{'content':'','annotations':['x',None]}}],
+                                 'usage':{'server_tool_use_details':None}}).encode()
+        session=Mock();session.post.return_value=odd
+        with self.assertRaises(CheckError):web_search.search_query('q',session=session,key='k',model='m')
+        odd._content=json.dumps({'choices':[{'message':{'content':'','annotations':['x',{'type':'url_citation','url_citation':None}]}}],
+                                 'usage':{'server_tool_use_details':{'web_search_requests':1}}}).encode()
+        self.assertEqual(web_search.search_query('q',session=session,key='k',model='m')['hits'],[])
+        config={'enabled':['hh','web'],'boards':[],'career_pages':[],'max_web_links':30}
+        with JobStore(self.db) as store, patch('web_search.refresh',side_effect=AttributeError('boom')),              patch('browser_check.run',side_effect=CheckError('stop')) as browser:
+            report=discovery.collect(store,search_settings.validate({}),PREF,config=config,client=Mock(),
+                                     report_path=self.root/'report.json',refresh_web=True,web_path=self.root/'web.json')
+        browser.assert_called_once()
+        web=next(e for e in report['sources'] if e.get('source')=='Веб-поиск')
+        self.assertEqual(web['status'],'refresh_error')
+        self.assertTrue(any('Веб-поиск' in w for w in discovery.coverage_warnings(report)))
+        self.assertTrue(any('Веб-поиск' in str(w) for w in report.get('warnings',[])+[json.dumps(report,ensure_ascii=False)]))
+
+    def test_some_unreadable_hh_cards_do_not_suggest_a_login_problem(self):
+        # Senior review 13.11 (pipeline 9): one unreadable card produced «проверьте вход в HH».
+        warnings=discovery.coverage_warnings({'sources':[{'source':'HH','status':'partial','details':{'errors':2}}]})
+        self.assertIn('2',warnings[0]);self.assertNotIn('вход',warnings[0])
+
+    def test_invalid_settings_stop_the_scheduled_run_with_the_real_reason(self):
+        # Senior review 13.11 (pipeline 10): parser.error after the slot was claimed looked like an interrupted run.
+        import scheduled_run
+        data=self.root/'data';data.mkdir(exist_ok=True)
+        (self.root/'profile/hunt.lock').touch()
+        with patch.object(scheduled_run,'ROOT',self.root),patch.object(scheduled_run,'STATE',data/'last_scheduled_run.json'), \
+             patch.object(scheduled_run,'schedule_slot',return_value='2026-11-13T18'),patch('hunt.main',side_effect=SystemExit(2)), \
+             patch.object(hunt,'save_report',side_effect=lambda value,path:Path(path).write_text(json.dumps(value),encoding='utf-8')):
+            code=scheduled_run.main()
+        state=json.loads((data/'last_scheduled_run.json').read_text(encoding='utf-8'))
+        self.assertEqual(code,2);self.assertEqual(state['state'],'stopped');self.assertIn('настройки',state['error'].lower())
+
+    def test_lock_taken_for_a_moment_by_a_status_probe_is_waited_for(self):
+        # Senior review 13.11 (web 8 / audit A21): the UI's 2.5 s busy probe holds the real lock for milliseconds;
+        # a run starting in that instant failed with RunBusy instead of waiting a moment.
+        lock=self.root/'probe.lock';calls=[0];real=run_lock._lock
+        def contended(stream):
+            calls[0]+=1
+            if calls[0]==1:raise OSError('held by the probe')
+            return real(stream)
+        with patch('run_lock._lock',side_effect=contended),patch('run_lock.time.sleep'):
+            with run_lock.one_run(lock):pass
+        self.assertEqual(calls[0],2)
 
     def test_status_names_search_failure_together_with_work_issues(self):
         # Since 05.11.2026 "Требуют внимания: 3" hid the broken web search in the headline and notifications.
@@ -217,6 +344,45 @@ class ResilienceTests(unittest.TestCase):
              patch('scheduled_runner.time.sleep'),patch('subprocess.Popen') as notify:
             scheduled_runner.main();scheduled_runner.main()
         self.assertEqual(notify.call_count,2)
+
+    def test_scheduled_run_keeps_one_daily_database_copy_for_two_weeks(self):
+        # Audit A13: no automatic backup of jobs.sqlite (applications history, user decisions) existed.
+        import sqlite3,common
+        data=self.root/'data';data.mkdir()
+        db=sqlite3.connect(data/'jobs.sqlite');db.execute('CREATE TABLE jobs(x)');db.execute("INSERT INTO jobs VALUES ('мой отклик')");db.commit();db.close()
+        backups=data/'backups';backups.mkdir()
+        for day in range(1,20):(backups/f'jobs-2026-10-{day:02d}.sqlite').write_bytes(b'old')
+        (backups/'before-review-fixes-20261027T085511Z.sqlite').write_bytes(b'manual')
+        common.daily_backup(data/'jobs.sqlite',backups,today='2026-11-10')
+        common.daily_backup(data/'jobs.sqlite',backups,today='2026-11-10')
+        copy=sqlite3.connect(backups/'jobs-2026-11-10.sqlite')
+        self.assertEqual(copy.execute('SELECT x FROM jobs').fetchone()[0],'мой отклик');copy.close()
+        daily=sorted(p.name for p in backups.glob('jobs-*.sqlite'))
+        self.assertEqual(len(daily),14);self.assertEqual(daily[-1],'jobs-2026-11-10.sqlite')
+        self.assertTrue((backups/'before-review-fixes-20261027T085511Z.sqlite').exists())  # manual copies untouched
+        with patch.object(scheduled_runner,'ROOT',self.root),patch('scheduled_run.main',return_value=0), \
+             patch('common.daily_backup') as backup,patch('subprocess.Popen'):
+            scheduled_runner.main()
+        backup.assert_called_once()
+
+    def test_runner_uses_telegram_instead_of_popup_when_configured(self):
+        import sqlite3,run_status
+        data=self.root/'data';data.mkdir()
+        with patch.object(scheduled_runner,'ROOT',self.root),patch('telegram_events.configured',return_value=True), \
+             patch('scheduled_run.main',return_value=75),patch('scheduled_runner.time.sleep'),patch('subprocess.Popen') as popup:
+            scheduled_runner.main()
+        popup.assert_not_called()
+        db=sqlite3.connect(data/'jobs.sqlite')
+        try:rows=db.execute('SELECT kind,payload_json FROM telegram_outbox').fetchall()
+        finally:db.close()
+        self.assertEqual(rows[0][0],'problem');self.assertIn(run_status.WAIT_EXPIRED,json.loads(rows[0][1])['message'])
+
+    def test_runner_keeps_popup_when_telegram_not_configured(self):
+        data=self.root/'data';data.mkdir()
+        with patch.object(scheduled_runner,'ROOT',self.root),patch('telegram_events.configured',return_value=False), \
+             patch('scheduled_run.main',return_value=75),patch('scheduled_runner.time.sleep'),patch('subprocess.Popen') as popup:
+            scheduled_runner.main()
+        self.assertIn('-Problem',popup.call_args.args[0])
 
     def test_interrupted_run_is_shown_even_after_earlier_ui_action(self):
         app=hunter_web.App(self.root,db_path=self.db)

@@ -45,15 +45,25 @@ def search_url(*, junior: bool = False, text: str | None = None, page: int = 0, 
 
 
 ENTRY_TERMS = '(junior OR trainee OR intern OR стажер OR стажёр OR начинающий OR младший)'
-ROLE_TERMS = ('("machine learning" OR "ML Engineer" OR "AI Engineer" OR LLM OR NLP '
-              'OR "Computer Vision" OR "Data Scientist" OR "машинного обучения" '
-              'OR "машинное обучение" OR "искусственного интеллекта")')
+# Titles are searched (search_field=name). Bare AI/ML/ИИ catch «AI/ML-разработчик», «ML-инженер», «Специалист по
+# прикладному ИИ»; the noise they also bring (AI marketing, content, sales) is dropped by relevance.OTHER_ROLE
+# before any paid step.
+ROLE_TERMS = ('(AI OR ML OR ИИ OR LLM OR NLP OR "machine learning" OR "Computer Vision" OR "Data Scientist" '
+              'OR нейросет* OR "машинного обучения" OR "машинное обучение" OR "искусственного интеллекта")')
+# Without it the noise filled both result pages of the bare-AI query (60 hits on 10.11.2026) and pushed real
+# roles out; with it 27 hits kept all 21 relevant titles. Only non-engineering words: no title with
+# engineer/разработчик is excluded here (relevance.NOISE_ROLE does the finer local check).
+NOISE_EXCLUSION = (' NOT (маркет* OR SMM OR SEO OR GEO OR контент* OR content OR креат* OR creat* OR дизайн* '
+                   'OR design* OR продаж* OR sales OR менеджер* OR manager OR преподават* OR учител* OR юрист* '
+                   'OR видео* OR video OR монтаж* OR оператор* OR ассистент* OR assistant OR поддержк* OR лектор* '
+                   'OR спикер* OR тренер* OR руководител* OR директор*)')
 SEARCH_PROFILES = (
-    ("Junior и стажировки", f"{ENTRY_TERMS} AND {ROLE_TERMS}"),
-    ("ML и Data Science", '("Data Scientist" OR "ML Engineer" OR "machine learning" '
-                            'OR MLOps OR "машинного обучения" OR "машинное обучение")'),
-    ("Applied AI, LLM и Computer Vision", '("AI Engineer" OR LLM OR NLP OR "Computer Vision" '
-                                          'OR "инженер ИИ" OR "искусственного интеллекта")'),
+    ("Junior и стажировки", f"{ENTRY_TERMS} AND {ROLE_TERMS}{NOISE_EXCLUSION}"),
+    ("ML и Data Science", '(ML OR MLOps OR "Data Scientist" OR "Data Science" OR "machine learning" '
+                            'OR "Deep Learning" OR "машинного обучения" OR "машинное обучение")'),
+    ("Applied AI, LLM и Computer Vision", '(AI OR ИИ OR LLM OR NLP OR GenAI OR RAG OR "Computer Vision" '
+                                          'OR нейросет* OR "искусственного интеллекта" OR "искусственный интеллект")'
+                                          + NOISE_EXCLUSION),
 )
 
 
@@ -73,6 +83,8 @@ def search_plan(*, junior: bool, expanded: bool, pages: int, settings=None) -> l
 SEARCH_URL = search_url()
 TITLE_LINKS = 'a[data-qa="serp-item__title"], a[data-qa="vacancy-serp__vacancy-title"]'
 DESCRIPTION = '[data-qa="vacancy-description"]'
+# Title banner (until 13.11.2026) or the «Вакансия в архиве» block above a collapsed description (17.11.2026).
+ARCHIVED_BANNER = '[data-qa="vacancy-title-archived-text"], [data-qa="vacancy-archive-description"]'
 TIMEOUT_MS = 30_000
 
 
@@ -136,9 +148,11 @@ def refresh_saved(store, jobs):
                     remaining.remove(job)
             finally:context.close()
     except (BrowserStop,PlaywrightError):
+        # Nothing was paid for yet: skip them in this run and let the next run refresh them again,
+        # instead of a manual paid retry per vacancy. The run's HH status still shows the failure.
         for job in remaining:
             outcome['failed'].append(('hh',job['vacancy_id']))
-            work_queue.stage(store,job,'refresh_failed','HH временно недоступен или требуется ручной вход/капча. Другие источники продолжаются.')
+            work_queue.stage(store,job,'new','HH временно недоступен или требуется ручной вход/капча; повтор в следующем запуске.')
     return outcome
 
 
@@ -173,11 +187,15 @@ def check_blocker(page) -> None:
         raise BrowserStop("HH показывает проверку робота или блокировку доступа; автоматическое продолжение остановлено.")
 
 
+class PageUnavailable(BrowserStop):
+    """This page did not load (timeout, network error, HH 5xx); other pages may still work."""
+
+
 def navigate(page, url: str, stage: str) -> None:
     try:
         result = page.goto(url, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
     except PlaywrightTimeout:
-        raise BrowserStop(f"Таймаут: не удалось открыть {stage} за 30 секунд.") from None
+        raise PageUnavailable(f"Таймаут: не удалось открыть {stage} за 30 секунд.") from None
     except PlaywrightError as exc:
         # Emit a known error code only, never a browser log, URL parameters or session data.
         if page.is_closed() or "Target page, context or browser has been closed" in str(exc):
@@ -188,17 +206,45 @@ def navigate(page, url: str, stage: str) -> None:
             raise BrowserStop(f"Переход к странице «{stage}» прерван другой навигацией в этой вкладке.") from None
         code = re.search(r"net::(ERR_[A-Z_]+)", str(exc))
         suffix = f" ({code.group(1)})" if code else ""
-        raise BrowserStop(f"Не удалось открыть {stage}{suffix}.") from None
+        raise PageUnavailable(f"Не удалось открыть {stage}{suffix}.") from None
     if result is not None and result.status in (404, 410):
         raise VacancyClosed(f"HH вернул HTTP {result.status}: страница недоступна.")
+    if result is not None and result.status >= 500:
+        raise PageUnavailable(f"HH вернул HTTP {result.status}: не удалось открыть {stage}.")
     if result is not None and result.status >= 400:
         raise BrowserStop(f"HH вернул HTTP {result.status}: не удалось открыть {stage}.")
+
+
+LOGIN_CHECK_URL = "https://hh.kz/applicant/resumes"
+
+
+def verify_login(context) -> bool:
+    """True when HH opens the applicant's resumes page instead of redirecting to login (audit A25)."""
+    page = context.new_page()
+    try:
+        navigate(page, LOGIN_CHECK_URL, "проверку входа HH")
+        try:
+            page.wait_for_load_state("load", timeout=10_000)  # a script redirect to login comes after DOM ready
+        except PlaywrightError:
+            pass
+        check_blocker(page)
+        return True
+    except BrowserStop as exc:
+        if "на вход" in str(exc) or "HTTP 401" in str(exc) or "HTTP 403" in str(exc):
+            return False
+        raise  # captcha, network or HH errors are reported as they are, not as «not logged in»
+    finally:
+        try:
+            page.close()
+        except PlaywrightError:
+            pass
 
 
 def wait_for_content(page, selector: str, label: str) -> None:
     check_blocker(page)
     try:
-        page.locator(selector).first.wait_for(state="visible", timeout=15_000)
+        # Any visible match: an archived page keeps a hidden description before the visible archive block.
+        page.locator(selector).locator("visible=true").first.wait_for(state="visible", timeout=15_000)
     except PlaywrightTimeout:
         check_blocker(page)
         raise VacancyReadError(
@@ -279,7 +325,14 @@ def vacancy_region(page) -> str:
 
 
 def read_vacancy(page, vacancy_id: str, url: str) -> dict:
-    wait_for_content(page, DESCRIPTION, "полное описание вакансии")
+    # HH answers an archived vacancy with HTTP 200, with or without the description; only this banner tells it apart.
+    try:
+        wait_for_content(page, f"{DESCRIPTION}, {ARCHIVED_BANNER}", "полное описание вакансии")
+    except VacancyReadError:
+        raise VacancyReadError(f"Не найден элемент «полное описание вакансии» ({DESCRIPTION}); "
+                               "страница не загрузилась или интерфейс HH изменился.") from None
+    if page.locator(ARCHIVED_BANNER).count():
+        raise VacancyClosed(f"Вакансия {vacancy_id} в архиве на HH.")
     title = first_text(page, ('[data-qa="vacancy-title"]',))
     company = first_text(page, ('[data-qa="vacancy-company-name"]',))
     region = vacancy_region(page)
@@ -329,12 +382,17 @@ def collect_links(detail,store,links,*,limit,refresh,counts,seen,preferences,set
         except VacancyClosed:
             counts.setdefault('closed_ids',[]).append(vacancy_id)
             continue
-        except VacancyReadError as exc:
+        except (VacancyReadError,PageUnavailable) as exc:
             counts['errors']+=1
+            counts.setdefault('error_ids',[]).append(vacancy_id)
             print(f'[ПРОПУЩЕНО] {exc}')
+            counts['unreachable_streak']=counts.get('unreachable_streak',0)+1 if isinstance(exc,PageUnavailable) else 0
+            if counts['unreachable_streak']>=3:raise  # HH itself is down: stop instead of waiting on every card
             continue
+        counts['unreachable_streak']=0
         if not relevant(vacancy['name'],settings or SEARCH_DEFAULTS):
             counts['skipped']+=1
+            counts.setdefault('skipped_ids',[]).append(vacancy_id)
             continue
         if vacancy.get('published_at'):
             try:

@@ -29,7 +29,8 @@ DEFAULT_MODEL = ""  # the model is chosen by the user: OPENROUTER_MODEL in .env
 PROMPT_VERSION = "cv-match-v4-ids"
 MAX_OUTPUT_TOKENS = 2200
 # Provider caps in USD per million tokens, enforced in the OpenRouter request.
-PRICE_CAP = {"prompt": 0.10, "completion": 0.40, "request": 0}
+# 13.11.2026: 0.10/0.40 left zero endpoints for the configured model -> HTTP 404 everywhere; raise if your model costs more.
+PRICE_CAP = {"prompt": 0.15, "completion": 0.70, "request": 0}
 AUDIT_PRICE_CAP = {"prompt": 4.0, "completion": 20.0, "request": 0}
 CV_FILES = {"ml_engineer": "CV_ML_ENGINEER_EN.docx", "applied_ai": "CV_APPLIED_AI_EN.docx"}
 DECISIONS = {"apply": "Рассмотреть отклик", "stretch": "Отклик с заметными пробелами", "skip": "Низкий приоритет"}
@@ -200,6 +201,14 @@ def resolve_evidence(result: dict, job: dict, profiles: dict) -> dict:
     return validate_result(resolved, job, profiles)
 
 
+FLAG_TEXTS = (
+    "Модель нашла только частичные совпадения; полного соответствия выбранным требованиям нет.",
+    "Требование стажа выше целевого Junior/Strong Junior; такой стаж нужно подтвердить отдельно по CV.",
+    "Указан офис в Астане; доступность удалённого формата или готовность к переезду не подтверждены.",
+)
+MODEL_MARK = "Оценка модели:"
+
+
 def apply_safeguards(result: dict, job: dict) -> dict:
     """Conservative personal Junior/Strong Junior policy, independent of model prose."""
     result = json.loads(json.dumps(result))
@@ -235,8 +244,26 @@ def apply_safeguards(result: dict, job: dict) -> dict:
     if flags:
         if result["decision"] == "apply":
             result["decision"] = "stretch"
-        # A model's optimistic summary must not override deterministic checks.
-        result["summary"] = " ".join(flags)
+        # Deterministic checks come first and win; the model's explanation is kept after them (audit A28).
+        # Idempotent: stored assessments are re-read through here; earlier flags are kept, never doubled,
+        # and the result always fits the 700-character summary limit (senior review 13.11).
+        summary = str(result.get("summary") or "").strip()
+        earlier = [text for text in FLAG_TEXTS if text in summary]
+        if MODEL_MARK in summary:
+            model_summary = summary.split(MODEL_MARK, 1)[1].strip()
+        else:
+            model_summary = summary
+            for text in FLAG_TEXTS:
+                model_summary = model_summary.replace(text, "")
+            model_summary = model_summary.strip()
+        head = " ".join(text for text in FLAG_TEXTS if text in flags or text in earlier)
+        room = TEXT["maxLength"] - len(head) - len(MODEL_MARK) - 2
+        if model_summary and room >= 40:
+            if len(model_summary) > room:
+                model_summary = model_summary[:room - 1].rstrip() + "…"
+            result["summary"] = f"{head} {MODEL_MARK} {model_summary}"
+        else:
+            result["summary"] = head[:TEXT["maxLength"]]
     return result
 
 

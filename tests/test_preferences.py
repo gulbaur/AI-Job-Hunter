@@ -32,6 +32,40 @@ class LocationTests(unittest.TestCase):
         result, _ = location_fit({"region": "Астана", "description_text": "Удалённая работа не предусмотрена."}, PREFERENCES)
         self.assertEqual(result, "blocked")
 
+    def test_office_phrasings_and_hybrid_outside_almaty_are_office(self):
+        # Audit A6: all of these passed as remote_review and spent a paid assessment.
+        for text in ["Удалённая работа невозможна.", "Формат: офис, без удалёнки.",
+                     "Гибрид: 2 дня удалённо, 3 в офисе.", "Hybrid: 3 days in the office, remote on Fridays.",
+                     "Формат работы — гибридный (удалённо до 2 дней в неделю)."]:
+            result, _ = location_fit({"region": "Астана", "description_text": text}, PREFERENCES)
+            self.assertEqual(result, "blocked", text)
+
+    def test_hybrid_with_full_remote_option_still_needs_remote_review(self):
+        for text in ["Формат: гибрид или полностью удалённо.", "Hybrid or fully remote."]:
+            result, _ = location_fit({"region": "Астана", "description_text": text}, PREFERENCES)
+            self.assertEqual(result, "remote_review", text)
+
+
+class ExcludedCompanyTests(unittest.TestCase):
+    """Moved from the archived tests/test_apply.py (audit A38)."""
+    def test_excluded_companies_are_exact_and_backward_compatible(self):
+        import json,tempfile
+        from pathlib import Path
+        from preferences import load_preferences,company_is_excluded
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            data={"office_city":"Алматы","other_locations":"remote_only","remote_from":"Казахстан"}
+            (root/"preferences.json").write_text(json.dumps(data),encoding="utf-8")
+            self.assertEqual(load_preferences(root),data)
+            data["excluded_companies"]=["Kaspi.kz","Kaspi"]
+            (root/"preferences.json").write_text(json.dumps(data),encoding="utf-8")
+            prefs=load_preferences(root)
+            self.assertTrue(company_is_excluded({"company":"  KASPI.KZ  "},prefs))
+            self.assertFalse(company_is_excluded({"company":"Other Kaspi partners"},prefs))
+            # Senior review 13.11 (pipeline 13): web-search ATS links name the company by its slug.
+            self.assertTrue(company_is_excluded({"company":"higgsfieldai"},{"excluded_companies":["Higgsfield AI"]}))
+            self.assertFalse(company_is_excluded({"company":"Higgsfield AI Labs"},{"excluded_companies":["Higgsfield AI"]}))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -55,11 +55,15 @@ def save(profile_dir, settings):
     path.parent.mkdir(parents=True,exist_ok=True)
     temporary=path.with_suffix('.tmp')
     temporary.write_text(json.dumps(validate(settings),ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
-    temporary.replace(path)
+    from common import replace_file
+    replace_file(temporary,path)
 
 
 def title_allowed(title, settings):
-    return not any(word.casefold() in title.casefold() for word in settings['excluded_title_words'])
+    # Whole words only (audit A32): «Lead» must not exclude «Leading AI Engineer».
+    import re
+    text=str(title or '').casefold()
+    return not any(re.search(r'(?<!\w)'+re.escape(word.casefold())+r'(?!\w)',text) for word in settings['excluded_title_words'])
 
 
 def relevant(title, settings):

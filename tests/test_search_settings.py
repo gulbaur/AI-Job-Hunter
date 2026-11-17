@@ -75,6 +75,15 @@ class SettingsTests(unittest.TestCase):
                 self.assertEqual(draft_queue.pending(store,PREF,settings),[])
                 self.assertEqual(hunt.eligible(store,PREF,settings=settings),[])
 
+    def test_excluded_title_word_matches_whole_words_only(self):
+        # Audit A32: «Lead» also excluded «Leading AI Engineer»; «ML» would exclude «HTML».
+        settings=search_settings.validate({'excluded_title_words':['Lead','Senior ML']})
+        self.assertFalse(search_settings.title_allowed('Team Lead, Data Science',settings))
+        self.assertFalse(search_settings.title_allowed('Senior ML Engineer',settings))
+        self.assertTrue(search_settings.title_allowed('Leading AI Engineer',settings))
+        self.assertTrue(search_settings.title_allowed('Senior MLOps Engineer',settings))
+        self.assertFalse(search_settings.title_allowed('Junior MLOps (lead)',search_settings.validate({'excluded_title_words':['MLOps']})))
+
     def test_scheduled_preparation_has_no_send_flag_and_runs_once_per_slot(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);report=root/'report.json'

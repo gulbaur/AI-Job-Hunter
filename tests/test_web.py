@@ -66,6 +66,25 @@ class WebTests(unittest.TestCase):
         self.assertIn('Профиль браузера занят',state['task']['message'])
         self.assertEqual(len(state['jobs']),1)
 
+    def test_empty_body_and_unknown_action_get_precise_answers(self):
+        # Audit A37: an empty body was «Слишком большой запрос», an unknown action «Черновик уже обработан».
+        request=Request(self.url+'/api/skip',data=b'',headers={'Content-Type':'application/json','X-Hunter-Token':self.app.csrf})
+        with self.assertRaises(HTTPError) as exc:urlopen(request,timeout=3)
+        self.assertEqual(exc.exception.code,400)
+        with self.assertRaises(HTTPError) as exc:self.post('no-such-action',{'key':'hh:999'})
+        self.assertIn('Неизвестное действие',json.loads(exc.exception.read())['error'])
+
+    def test_second_server_cannot_share_the_port(self):
+        # Audit A24: SO_REUSEADDR let a second copy bind the same port on Windows; requests went to the first one.
+        with self.assertRaises(OSError):hunter_web.Server(('127.0.0.1',self.server.server_port),self.app)
+
+    def test_client_gone_before_reply_is_silent(self):
+        # Audit A23: a closed browser tab produced a 500 written into a dead socket and two tracebacks.
+        handler=hunter_web.Handler.__new__(hunter_web.Handler)
+        handler.send_response=Mock();handler.send_header=Mock();handler.end_headers=Mock()
+        handler.wfile=Mock();handler.wfile.write.side_effect=ConnectionAbortedError(10053,'aborted')
+        handler.reply(200,{'ok':True})
+
     def test_local_origin_csrf_and_static_allowlist(self):
         for headers in [{'X-Hunter-Token':'wrong'},{'Origin':'https://evil.example'},{'Host':'evil.example'},
                         {'Sec-Fetch-Site':'cross-site'}]:
@@ -127,6 +146,60 @@ class WebTests(unittest.TestCase):
         with self.assertRaises(CheckError):self.app.mutate('letter',{'key':'hh:1','text':'changed'})
         self.assertEqual(self.app.state()['jobs'][0]['letter'],'Письмо пользователя')
 
+    def test_letter_save_survives_a_brief_file_lock_and_never_claims_a_failed_save(self):
+        # Senior review 13.11 (web 2): os.replace on a letter another process reads raised WinError 5; the server
+        # answered «Данные сохранены» although nothing was saved.
+        import common,os
+        real=os.replace;calls=[0]
+        def flaky(src,dst):
+            calls[0]+=1
+            if calls[0]==1:raise PermissionError(5,'Access is denied')
+            return real(src,dst)
+        with patch('common.os.replace',side_effect=flaky),patch('time.sleep'):
+            self.app.mutate('letter',{'key':'hh:1','text':'Новый текст'})
+        self.assertEqual(json.loads(urlopen(self.url+'/api/state').read())['jobs'][0]['letter'],'Новый текст')
+        with patch('common.os.replace',side_effect=PermissionError(5,'Access is denied')),patch('time.sleep'), \
+             self.assertRaises(HTTPError) as exc:
+            self.post('letter',{'key':'hh:1','text':'Ещё текст'})
+        error=json.loads(exc.exception.read())['error']
+        self.assertIn('НЕ сохран',error);self.assertNotIn('Данные сохранены',error)
+
+    def test_confirmed_send_is_recorded_even_if_the_final_screenshot_fails(self):
+        # Senior review 13.11 (web 5): a failing after-submit screenshot hid a confirmed delivery.
+        from playwright.sync_api import sync_playwright
+        from playwright.sync_api._generated import Page
+        import contextlib
+        import hh_response
+        original=Page.screenshot
+        def shot(page,*args,**kwargs):
+            if 'after-submit' in str(kwargs.get('path','')):raise RuntimeError('window closed')
+            return original(page,*args,**kwargs)
+        with sync_playwright() as p,self.app.store() as store:
+            packet=json.loads(self.path.read_text(encoding='utf-8'))
+            browser=p.chromium.launch(headless=True)
+            def context(*args,**kwargs):
+                ctx=browser.new_context()
+                def route(req):
+                    url=req.request.url
+                    if '/submit' in url:req.fulfill(body='ok');return
+                    if '/applicant/vacancy_response' in url:
+                        html='''<meta charset="utf-8"><form><div data-qa="resume-title">AI/ML Engineer</div>
+                        <textarea data-qa="vacancy-response-popup-form-letter-input"></textarea>
+                        <button data-qa="vacancy-response-submit-popup">Send</button></form><script>
+                        document.querySelector('form').onsubmit=async e=>{e.preventDefault();
+                        await fetch('/submit',{method:'POST',body:'x'});document.body.innerHTML='<div>Резюме доставлено</div>';};</script>'''
+                    else:html='<a data-qa="vacancy-response-link-top" href="/applicant/vacancy_response?vacancyId=1">Open</a>'
+                    req.fulfill(status=200,content_type='text/html',body=html)
+                ctx.route('**/*',route);return ctx
+            fake=Mock();fake.__enter__=Mock(return_value=fake);fake.__exit__=Mock(return_value=False)
+            fake.chromium.launch_persistent_context.side_effect=context
+            with patch('playwright.sync_api.sync_playwright',return_value=fake),patch('sys.stdin',None), \
+                 patch.object(Page,'screenshot',autospec=True,side_effect=shot),contextlib.redirect_stdout(io.StringIO()):
+                state=hh_response.run(packet,store.connection,allow_send=True,confirmation_channel=lambda review,token:token)
+            browser.close()
+            self.assertEqual(state,'confirmed_by_site')
+            self.assertEqual(store.get('1')['status'],'applied')
+
     def test_browser_channel_cancel_and_exact_approval_submit_local_form_once(self):
         from playwright.sync_api import sync_playwright
         import contextlib
@@ -159,6 +232,8 @@ class WebTests(unittest.TestCase):
                 self.assertEqual(hh_response.run(packet,store.connection,allow_send=True,confirmation_channel=cancel),'cancelled_before_send')
                 self.assertEqual(submitted,[])
                 self.assertEqual(cancel.call_args.args[0]['hh_resume_title'],'AI/ML Engineer')
+                # The bot sends this picture of the filled form to the phone (user request 13.11.2026).
+                self.assertTrue(Path(cancel.call_args.args[0]['form_image']).is_file())
                 self.assertEqual(cancel.call_args.args[1],'ОТПРАВИТЬ 1')
                 self.assertEqual(hh_response.run(packet,store.connection,allow_send=True,confirmation_channel=lambda review,token:token),'confirmed_by_site')
                 self.assertEqual(submitted,['Письмо пользователя'])
@@ -241,6 +316,45 @@ class WebTests(unittest.TestCase):
         self.app.confirm({'attempt':c['attempt'],'checked':True})
         thread.join(2);self.assertEqual(done,[None])
         with self.assertRaises(CheckError):self.app.confirm({'attempt':c['attempt'],'checked':True})
+
+    def test_manual_sent_allowed_for_hh_with_exact_phrase(self):
+        with self.assertRaises(HTTPError):self.post('manual-sent',{'key':'hh:1','text':'да'})
+        self.post('manual-sent',{'key':'hh:1','text':'ОТПРАВЛЕНО 1'}).close()
+        self.assertEqual(self.app.state()['history'][0]['state'],'reported_by_user')
+
+    def test_one_broken_packet_does_not_blank_the_whole_ui(self):
+        # Audit A15: one packet with a missing letter or an http:// link made /api/state answer 500.
+        for identity,breakage in (('2','letter'),('3','url')):
+            folder=self.root/f'drafts/bad{identity}';folder.mkdir(parents=True)
+            letter=folder/'letter.txt';letter.write_text('x',encoding='utf-8')
+            packet=json.loads(self.path.read_text(encoding='utf-8'))
+            packet.update(vacancy_id=identity,url=f'https://hh.kz/vacancy/{identity}',letter_path=str(letter),output_dir=str(folder))
+            path=folder/'application.json';path.write_text(json.dumps(packet),encoding='utf-8')
+            with self.app.store() as store:store.save(vacancy(identity));draft_queue.register(store.connection,path)
+            if breakage=='letter':letter.unlink()
+            else:path.write_text(json.dumps({**packet,'url':f'http://hh.kz/vacancy/{identity}'}),encoding='utf-8')
+        state=json.loads(urlopen(self.url+'/api/state',timeout=3).read())
+        self.assertEqual([j['id'] for j in state['jobs']],['1'])
+        self.assertEqual(sorted(b['key'] for b in state['broken']),['hh:2','hh:3'])
+        self.assertTrue(all(b['error'] for b in state['broken']))
+
+    def test_state_reports_user_edited_letter(self):
+        self.assertFalse(self.app.state()['jobs'][0]['edited'])
+        self.post('letter',{'key':'hh:1','text':'Моя правка'}).close()
+        self.assertTrue(self.app.state()['jobs'][0]['edited'])
+
+    def test_state_shows_dead_bot(self):
+        import os
+        from datetime import datetime,timedelta,timezone
+        (self.root/'.env').write_text('TELEGRAM_BOT_TOKEN=1:x\nTELEGRAM_CHAT_ID=42\n',encoding='utf-8')
+        (self.root/'data').mkdir(exist_ok=True)
+        beat=self.root/'data/telegram_bot_heartbeat.json'
+        beat.write_text(json.dumps({'pid':1,'updated_at':(datetime.now(timezone.utc)-timedelta(minutes=6)).isoformat(),'last_error':''}),encoding='utf-8')
+        with patch.dict(os.environ,{'TELEGRAM_BOT_TOKEN':'','TELEGRAM_CHAT_ID':''}):
+            telegram=self.app.state()['telegram']
+            self.assertTrue(telegram['configured']);self.assertFalse(telegram['alive'])
+            beat.write_text(json.dumps({'pid':1,'updated_at':datetime.now(timezone.utc).isoformat(),'last_error':''}),encoding='utf-8')
+            self.assertTrue(self.app.state()['telegram']['alive'])
 
     def test_failed_preparation_ui_retries_only_selected_job_without_send(self):
         import work_queue

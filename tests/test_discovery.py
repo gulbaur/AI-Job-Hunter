@@ -53,11 +53,30 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(len(items),1);self.assertIn(BODY,items[0]['description'])
             self.assertTrue(items[0]['id'].isdigit())
 
+    def test_greenhouse_date_is_first_publication_not_last_edit(self):
+        # Audit A33: updated_at changes on every edit, so a months-old vacancy looked fresh.
+        client=Mock();client.json.return_value={'jobs':[{'title':'ML Engineer','absolute_url':'https://jobs.example.com/2',
+            'location':{'name':'Worldwide'},'content':BODY,'updated_at':'2026-11-12T10:00:00-04:00',
+            'first_published':'2026-06-01T10:00:00-04:00'}]}
+        item=next(sources.board_jobs(client,{'kind':'greenhouse','slug':'example','name':'Example'}))
+        self.assertEqual(item['published_at'],'2026-06-01T10:00:00-04:00')
+
     def test_unlisted_or_empty_board_description_is_not_invented(self):
         client=Mock();client.json.return_value={'jobs':[{'isListed':False}]}
         self.assertEqual(list(sources.board_jobs(client,{'kind':'ashby','slug':'example','name':'Example'})),[])
-        client.json.return_value={'jobs':[{'title':'AI Engineer','jobUrl':'https://example.com/1'}]}
-        with self.assertRaises(CheckError):list(sources.board_jobs(client,{'kind':'ashby','slug':'example','name':'Example'}))
+        # Audit A8: one card without a description ("General Application") used to abort the whole board.
+        client.json.return_value={'jobs':[{'title':'General Application','jobUrl':'https://example.com/1'},
+            {'title':'AI Engineer','jobUrl':'https://example.com/2','descriptionHtml':'<p>'+BODY+'</p>'}]}
+        errors=[]
+        jobs=list(sources.board_jobs(client,{'kind':'ashby','slug':'example','name':'Example'},errors=errors))
+        self.assertEqual([j['name'] for j in jobs],['AI Engineer'])
+        self.assertEqual(errors,['General Application'])
+        client.json.return_value={'jobs':[{'title':'General Application','absolute_url':'https://example.com/g','content':''},
+            {'absolute_url':'https://example.com/x'},
+            {'title':'ML Engineer','absolute_url':'https://example.com/m','content':'<p>'+BODY+'</p>'}]}
+        errors=[]
+        jobs=list(sources.board_jobs(client,{'kind':'greenhouse','slug':'example','name':'Example'},errors=errors))
+        self.assertEqual([j['name'] for j in jobs],['ML Engineer']);self.assertEqual(len(errors),2)
 
     def test_jobposting_graph_remote_and_expiry_are_respected(self):
         item={'@type':'JobPosting','title':'AI Engineer','hiringOrganization':{'name':'Example'},
@@ -71,9 +90,20 @@ class SourceTests(unittest.TestCase):
         client.page.return_value=('https://example.com/job','<script type="application/ld+json">'+json.dumps(item)+'</script>')
         self.assertEqual(list(sources.page_jobs(client,'https://example.com/job')),[])
 
+    def test_jobposting_with_null_title_does_not_crash_the_run(self):
+        # Senior review 13.11 (pipeline 3): "title": null raised AttributeError and stopped the whole run.
+        item={'@type':'JobPosting','title':None,'hiringOrganization':{'name':'Example'},'description':BODY}
+        client=Mock();client.page.return_value=('https://example.com/job','<main>'+BODY+'</main><script type="application/ld+json">'+json.dumps(item)+'</script>')
+        try:list(sources.page_jobs(client,'https://example.com/job'))
+        except CheckError:pass  # a clear per-page rejection is fine; an AttributeError stopped the run
+
     def test_remote_only_is_not_global_eligibility(self):
         for description,state in [('Remote. US only.','blocked'),('Remote. Worldwide.','remote_review'),
-                                  ('Remote.','unconfirmed')]:
+                                  ('Remote.','unconfirmed'),
+                                  # Audit A7: the country list in brackets is read whole; a .kz domain is not a country.
+                                  ('Remote (Europe or Kazakhstan).','remote_review'),
+                                  ('Remote (EU, Kazakhstan, Georgia).','remote_review'),
+                                  ('Remote. Apply at https://kaspi.kz/careers or write to hr@kaspi.kz.','unconfirmed')]:
             self.assertEqual(sources.external_location({'region':'','description_text':description},PREF)[0],state)
 
     def test_custom_role_reaches_hh_and_title_filter_without_new_builtin_roles(self):
@@ -114,9 +144,10 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_failed_board_does_not_hide_other_sources_and_linkedin_is_not_fetched(self):
         item=sources.vacancy('https://company.example/job','AI Engineer','Example','Алматы',BODY)
-        def boards(client,board):
+        def boards(client,board,**kwargs):
             if board['slug']=='bad':raise CheckError('not available')
-            return iter([item])
+            # A short card must not stop the board: it is counted, the next card is still saved.
+            return iter([sources.vacancy('https://company.example/short','AI Engineer','Example','Алматы','Snippet'),item])
         client=Mock()
         config=sources.validate({'enabled':['companies','web'],'boards':[
             {'kind':'ashby','slug':'bad','name':'Bad'}, {'kind':'ashby','slug':'good','name':'Good'}], 'career_pages':[]})
@@ -124,6 +155,7 @@ class DiscoveryTests(unittest.TestCase):
             report=discovery.collect(self.store,self.settings,PREF,config=config,client=client,include_hh=False,
                 web_path=self.web(['https://www.linkedin.com/jobs/view/example-1']),report_path=self.root/'report.json')
         self.assertEqual([v['status'] for v in report['sources']],['error','checked','fresh','manual_link'])
+        self.assertEqual(report['sources'][1]['item_errors'],1)
         self.assertEqual(report['job_keys'],[['web',item['id']]])
         client.page.assert_not_called()
 
@@ -186,7 +218,7 @@ class DiscoveryTests(unittest.TestCase):
     def test_external_assessment_and_english_letter_use_correct_source(self):
         from test_hunt import EN
         self.store.save(vacancy('1'))
-        item=vacancy('1');item['alternate_url']='https://example.com/jobs/1';self.store.save(item,source='web')
+        item=vacancy('1',description='Python and FastAPI.');item['alternate_url']='https://example.com/jobs/1';self.store.save(item,source='web')
         jobs=[dict(self.store.get('1','web'))]
         profile=self.root/'profile';profile.mkdir()
         for filename in [*hunt.assess.CV_FILES.values(),*prepare.RU_FILES.values()]:

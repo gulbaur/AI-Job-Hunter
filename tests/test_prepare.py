@@ -90,6 +90,25 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(cached["status"], "rejected")
         self.assertEqual(cached["usage"]["cost"], 0.0001)
 
+    def test_new_cv_project_written_with_perfective_verbs_becomes_a_fact(self):
+        # 11.11.2026: a new CV project written with «Разработала…» was silently ignored.
+        ru = {"applied_ai": "Разработала техническое задание и прототип чат-бота поддержки для интернет-магазина.\n"
+                            "Подготовила промпты и сценарии оценки ответов модели на реальных обращениях.\n"
+                            "Составила документацию и инструкцию по запуску прототипа для команды.\n"
+                            "Школа программирования и онлайн-курсы по машинному обучению, 2024 год."}
+        facts = list(prepare.fact_catalog(ru)["applied_ai"].values())
+        self.assertEqual(len(facts), 3)
+        self.assertFalse(any(f.startswith("Школа") for f in facts))
+        en = {"applied_ai": "Created a technical specification and a support chatbot prototype for an online store.\n"
+                            "Wrote prompts and evaluation scenarios for model answers on real support tickets."}
+        self.assertEqual(len(prepare.fact_catalog(en, "en")["applied_ai"]), 2)
+        more = {"applied_ai": "Added retries and structured errors to the payment API client.\n"
+                              "Collaborated with analysts to define labeling rules for the review classifier.\n"
+                              "Ran evaluation of image classification models on product photos from the catalog.\n"
+                              "Reviewed model outputs against expert labels to find systematic errors.\n"
+                              "Examined retrieval failures in the RAG search over product manuals."}
+        self.assertEqual(len(prepare.fact_catalog(more, "en")["applied_ai"]), 5)
+
     def test_cross_cv_unknown_and_duplicate_facts_are_rejected(self):
         catalogs = prepare.fact_catalog(PROFILES)
         for ids in [["ML001", "AI001"], ["ML001", "ML999"], ["ML001", "ML001"]]:

@@ -4,6 +4,7 @@ from contextvars import ContextVar
 import json
 import os
 from pathlib import Path
+import time
 
 from common import CheckError
 
@@ -65,8 +66,12 @@ def one_run(path):
     locked=False;token=None
     try:
         if os.fstat(stream.fileno()).st_size==0:stream.write(b' ')
-        try:_lock(stream);locked=True
-        except OSError:raise RunBusy('Другой запуск ещё работает. Подготовка дождётся освобождения программы.') from None
+        for attempt in range(3):
+            # A status probe (web UI every 2.5 s, the bot) holds the lock for milliseconds: wait that out (audit A21).
+            try:_lock(stream);locked=True;break
+            except OSError:
+                if attempt==2:raise RunBusy('Программа сейчас занята другой операцией (подготовка писем, отклик HH или сохранение).') from None
+                time.sleep(0.1)
         stream.seek(0);previous=stream.read().strip()
         # Respect a still-running pre-upgrade version which used PID-only files.
         if previous.isdigit() and _alive(int(previous)):

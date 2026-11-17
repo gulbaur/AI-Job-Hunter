@@ -29,6 +29,7 @@ class BudgetSession:
     """One conservative reserve across both assessment and letter calls, including failures."""
     def __init__(self,session,budget):
         self.session=session;self.budget=budget;self.reserved=0.;self.calls=0;self.cost=0.;self.unknown=0
+        self.succeeded=0;self.failed=0
 
     def post(self,url,**kwargs):
         payload=kwargs['json']
@@ -46,8 +47,11 @@ class BudgetSession:
         self.reserved+=reserve;self.calls+=1
         try:response=self.session.post(url,**kwargs)
         except requests.RequestException:
-            self.unknown+=1
+            self.failed+=1  # no answer: the provider reports no usage; the reserve already covers it (A17)
             raise
+        if getattr(response,'status_code',200)!=200:
+            self.failed+=1;return response
+        self.succeeded+=1
         try:
             value=response.json().get('usage',{}).get('cost')
             if type(value) in (int,float) and math.isfinite(value) and value>=0:self.cost+=value
@@ -56,14 +60,60 @@ class BudgetSession:
         return response
 
     def summary(self):
-        return {'calls':self.calls,'reserved_usd':self.reserved,'known_cost_usd':self.cost,'unknown_cost_calls':self.unknown}
+        return {'calls':self.calls,'succeeded_calls':self.succeeded,'failed_calls':self.failed,'reserved_usd':self.reserved,
+                'known_cost_usd':self.cost,'unknown_cost_calls':self.unknown}
+
+
+def usage_text(usage):
+    """One honest line: what was actually charged versus the up-front ceiling (A17)."""
+    line=(f"Модель: {usage.get('calls',0)} запросов (успешных {usage.get('succeeded_calls',0)}, неудачных {usage.get('failed_calls',0)}); "
+          f"списано по данным API {usage.get('known_cost_usd',0):.4f} USD")
+    if usage.get('unknown_cost_calls'):line+=f"; без данных о стоимости: {usage['unknown_cost_calls']}"
+    return line+f"; резерв-потолок {usage.get('reserved_usd',0):.4f} USD (не списание)."
+
+
+
+def opportunity_key(job):
+    """Same employer, same role, same place: a repost or an aggregator copy, not a new opportunity."""
+    import re
+    def norm(value):return ' '.join(re.sub(r'[^\w]+',' ',str(value or '').casefold().replace('ё','е')).split())
+    company=re.sub(r'^(?:тоо|ао|ип|too|llp|jsc|ооо)\s+|\s+(?:inc|ltd|llc|llp|gmbh)$','',norm(job.get('company')))
+    return norm(job.get('title')),company,norm(job.get('region'))
+
+
+def duplicate_copies(store,rows):
+    """Later copies of an opportunity that is already in work (draft, application or the user's «Не подходит»).
+    A copy that already has its own draft stays visible; an archived original lets a repost count as new.
+    Two HH postings with the same title but different texts (e.g. two teams) are both kept; for aggregator
+    links (web) the texts of one talent pool differ a lot, so title, company and place are enough."""
+    from difflib import SequenceMatcher
+    db=store.connection
+    def table(name):return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(name,)).fetchone()
+    drafted=set(map(tuple,db.execute('SELECT source,vacancy_id FROM draft_queue').fetchall())) if table('draft_queue') else set()
+    attempted={r[0] for r in db.execute('SELECT target_url FROM application_attempts')} if table('application_attempts') else set()
+    groups={}
+    for row in sorted(rows,key=lambda r:(r['first_seen_at'],r['source'],r['vacancy_id'])):
+        if row['status']!='archived':groups.setdefault(opportunity_key(dict(row)),[]).append(row)
+    copies=set()
+    for group in groups.values():
+        for i,row in enumerate(group):
+            if (row['source'],row['vacancy_id']) in drafted or row['status'] in {'applied','skipped'}:continue
+            for earlier in group[:i]:
+                in_work=((earlier['source'],earlier['vacancy_id']) in drafted or earlier['status'] in {'applied','skipped'}
+                         or earlier['url'] in attempted)
+                similar=row['source']=='web' or SequenceMatcher(None,earlier['description_text'] or '',
+                                                                   row['description_text'] or '').ratio()>=.6
+                if in_work and similar:copies.add((row['source'],row['vacancy_id']));break
+    return copies
 
 
 def eligible(store,preferences,ids=None,limit=3,settings=None):
     rows=store.connection.execute("SELECT * FROM jobs WHERE source IN ('hh','web') ORDER BY last_seen_at DESC,vacancy_id DESC").fetchall()
+    copies=duplicate_copies(store,rows)
     result=[]
     for row in rows:
         job=dict(row)
+        if (job['source'],job['vacancy_id']) in copies:continue
         if ids is not None and not (('source' in job and (job['source'],job['vacancy_id']) in ids) or
                                     (job['source']=='hh' and job['vacancy_id'] in ids)):continue
         if job['status'] in {'applied','skipped','archived'} or company_is_excluded(job,preferences):continue
@@ -102,6 +152,12 @@ def prepare_one(store,jobs,*,model,profile_dir,output,session,run,budget,prefere
     return packets[0] if packets else None
 
 
+def is_outage(exc):
+    """Nothing was paid and nothing is wrong with the job: the service or the run budget stopped it."""
+    import model_api
+    return isinstance(exc,model_api.ModelUnavailable) or 'бюджет' in str(exc).casefold()
+
+
 def prepare_batch(store,jobs,*,model,profile_dir,output,session,run,budget,preferences,key='',limit=3,settings=None):
     profiles=assess.load_profiles(profile_dir)
     for job in jobs:
@@ -111,6 +167,11 @@ def prepare_batch(store,jobs,*,model,profile_dir,output,session,run,budget,prefe
                 job_keys=[(job['source'],job['vacancy_id'])],preferences=preferences,settings=settings,
                 retry_rejected=bool(job.get('_retry')))
         except CheckError as exc:
+            if run and is_outage(exc):
+                # Back to the queue, next scheduled run retries; later jobs are not sent to a failing service.
+                work_queue.stage(store,job,'new','Повтор в следующем запуске: '+str(exc))
+                print(f"Оценка {job['vacancy_id']} отложена до следующего запуска: {exc}")
+                return []
             if run:work_queue.stage(store,job,'assessment_failed',str(exc))
             print(f"Оценка {job['vacancy_id']} остановлена: {exc}")
             continue
@@ -125,8 +186,7 @@ def prepare_batch(store,jobs,*,model,profile_dir,output,session,run,budget,prefe
     russian={variant:assess.read_cv(profile_dir/name) for variant,name in prepare.RU_FILES.items()}
     packets=[]
     for job,result in candidates[:limit]:
-        import re
-        job={**job,'_letter_language':'en' if job['source']=='web' and not re.search('[А-Яа-яЁё]',job['description_text']) else 'ru'}
+        job={**job,'_letter_language':letter_language(job)}
         facts=profiles if job['_letter_language']=='en' else russian
         destination=output if limit==1 else output/(job['source']+'-'+job['vacancy_id'])
         try:
@@ -136,6 +196,7 @@ def prepare_batch(store,jobs,*,model,profile_dir,output,session,run,budget,prefe
         except CheckError as exc:
             if run:work_queue.stage(store,job,'letter_failed',str(exc))
             print(f"Письмо {job['vacancy_id']} не подготовлено: {exc}")
+            if is_outage(exc):break  # do not send the remaining letters to a failing service
             continue
         if packet is not None:
             packets.append(packet)
@@ -143,6 +204,15 @@ def prepare_batch(store,jobs,*,model,profile_dir,output,session,run,budget,prefe
             register(store.connection,destination/'application.json')
             work_queue.stage(store,job,'ready')
     return packets
+
+
+def letter_language(job):
+    """Letter and CV follow the vacancy's language, for HH too. Saved jobs split cleanly: English
+    descriptions have ~0% Cyrillic letters, Russian ones (even full of tech terms) 76% and more."""
+    import re
+    text=str(job.get('description_text') or '')
+    cyrillic=len(re.findall('[А-Яа-яЁёӘәҒғҚқҢңӨөҰұҮүҺһІі]',text));latin=len(re.findall('[A-Za-z]',text))
+    return 'en' if latin and cyrillic/(cyrillic+latin)<0.3 else 'ru'
 
 
 def make_packet(job,result,russian,model,*,profile_dir,output,session,run,budget,preferences,key,settings=None):
@@ -194,7 +264,7 @@ def refresh_candidates(store,jobs):
         except sources.JobUnavailable:
             with store.connection:store.connection.execute("UPDATE jobs SET status='archived',status_reason='closed' WHERE source=? AND vacancy_id=? AND status NOT IN ('applied','skipped')",key)
             work_queue.stage(store,job,'archived')
-        except (CheckError,requests.RequestException):
+        except Exception:
             failed.add(key)
             work_queue.stage(store,job,'refresh_failed','Не удалось обновить полное описание внешней вакансии. Другие вакансии продолжают обрабатываться.')
     return failed
@@ -367,13 +437,17 @@ def main(argv=None):
         print('[ОСТАНОВЛЕНО] Не удалось завершить этап; сохранённые результаты остаются.');return 1
     finally:
         report['finished_at']=datetime.now(timezone.utc).isoformat()
-        report['model_usage']=metered.summary() if metered else {'calls':0,'reserved_usd':0,'known_cost_usd':0,'unknown_cost_calls':0}
+        report['model_usage']=metered.summary() if metered else {'calls':0,'succeeded_calls':0,'failed_calls':0,'reserved_usd':0,
+                                                                  'known_cost_usd':0,'unknown_cost_calls':0}
         try:
             if args.run and acquired:
                 save_report(report,output/'run.json');save_report(report,LAST)
                 save_report(report,ROOT/'data/active_run.json')
+                if args.queue:
+                    import telegram_events
+                    telegram_events.run_finished(ROOT/'data/jobs.sqlite',report,root=ROOT)
         finally:locks.close()
-        print(f"Модель: {report['model_usage']['calls']} запросов; известная стоимость {report['model_usage']['known_cost_usd']:.6f} USD.")
+        print(usage_text(report['model_usage']))
 
 
 if __name__=='__main__':raise SystemExit(main())

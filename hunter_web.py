@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 from urllib.request import urlopen
 import webbrowser
 
+import actions
 import assess
 from common import CheckError
 import draft_queue
@@ -23,6 +24,7 @@ import hunt
 from preferences import load_preferences
 import search_settings
 import sources
+import telegram_store
 import work_queue
 import run_status
 from run_lock import is_busy
@@ -51,26 +53,35 @@ class App:
 
     def store(self):return JobStore(self.db_path)
 
-    def entries(self,store):
-        draft_queue.import_existing(store.connection,self.root)
-        return draft_queue.pending(store,load_preferences(self.root/'profile'),search_settings.load(self.root/'profile'))
+    def entries(self,store):return actions.pending(self.root,store)
 
-    def packet(self,store,key):
-        for path,packet in self.entries(store):
-            if packet['source']+':'+packet['vacancy_id']==key:
-                if not path.resolve().is_relative_to((self.root/'drafts').resolve()):break
-                if not Path(packet['letter_path']).resolve().is_relative_to((self.root/'drafts').resolve()):break
-                return path,packet
-        raise CheckError('Этот черновик уже обработан, исключён или недоступен. Обновите список.')
+    def telegram_status(self):
+        """Configured and alive: the bot rewrites its heartbeat every minute; >5 min old means it is not running."""
+        result={'configured':telegram_store.configured(self.root),'alive':False,'error':''}
+        try:
+            beat=json.loads((self.root/'data/telegram_bot_heartbeat.json').read_text(encoding='utf-8'))
+            age=datetime.now(timezone.utc)-datetime.fromisoformat(beat['updated_at'])
+            result.update(alive=age.total_seconds()<300,error=str(beat.get('last_error') or ''))
+        except (OSError,ValueError,KeyError,TypeError):pass
+        return result
+
+    def packet(self,store,key):return actions.packet(self.root,store,key)
 
     def state(self):
         external_busy=is_busy(self.root/'profile/hunt.lock')
         with self.store() as store:
             if not external_busy:work_queue.recover_legacy(store)
             entries=self.entries(store)
-            unread={p for p,_ in draft_queue.pending(store,load_preferences(self.root/'profile'),search_settings.load(self.root/'profile'),unread_only=True)}
-            jobs=[]
+            lost=[]
+            unread={p for p,_ in draft_queue.pending(store,load_preferences(self.root/'profile'),search_settings.load(self.root/'profile'),unread_only=True,problems=lost,root=self.root)}
+            jobs=[];broken=[]
+            for item in lost:
+                row=store.connection.execute('SELECT title,company FROM jobs WHERE source=? AND vacancy_id=?',(item['source'],item['vacancy_id'])).fetchone()
+                broken.append({'key':item['source']+':'+item['vacancy_id'],'title':row['title'] if row else 'Вакансия',
+                    'company':row['company'] if row else '','path':item['packet_path'],'error':'Черновик не открыт: '+item['error']+'.'})
             for path,packet in entries:
+              # One unreadable packet (deleted letter, bad link) is listed apart instead of failing the whole UI.
+              try:
                 if not Path(packet['letter_path']).resolve().is_relative_to((self.root/'drafts').resolve()):continue
                 row=store.connection.execute('SELECT region FROM jobs WHERE source=? AND vacancy_id=?',
                     (packet['source'],packet['vacancy_id'])).fetchone()
@@ -78,9 +89,14 @@ class App:
                     'id':packet['vacancy_id'],'title':packet['title'] or 'Вакансия','company':packet.get('company') or 'Компания не указана',
                     'url':sources.canonical_url(packet['url']),'decision':packet['decision'],
                     'summary':packet.get('assessment_summary',''),'gaps':packet.get('gaps',[]),
-                    'cv':Path(packet['local_cv_path']).name,'letter':Path(packet['letter_path']).read_text(encoding='utf-8'),
+                    'cv':actions.cv_for_sending(packet).name,'letter':Path(packet['letter_path']).read_text(encoding='utf-8'),
                     'region':row['region'] if row else '', 'unread':path in unread,
-                    'letter_mode':packet.get('letter_mode','literal'),'research':packet.get('company_research')})
+                    'letter_mode':packet.get('letter_mode','literal'),'research':packet.get('company_research'),
+                    'edited':actions.is_user_edited(store,packet)})
+              except (OSError,ValueError,KeyError,TypeError,AttributeError,CheckError) as exc:
+                reason='файл письма не найден' if isinstance(exc,FileNotFoundError) else str(exc) if isinstance(exc,CheckError) else type(exc).__name__
+                broken.append({'key':f"{packet.get('source','?')}:{packet.get('vacancy_id','?')}",'title':packet.get('title') or 'Вакансия',
+                    'company':packet.get('company') or '','path':str(path),'error':'Черновик не открыт: '+reason+'.'})
             store.connection.executescript(hh_response.SCHEMA)
             history=[dict(r) for r in store.connection.execute('''SELECT a.state,a.updated_at,a.target_url,
                 j.title,j.company,j.source,j.vacancy_id FROM application_attempts a LEFT JOIN jobs j ON j.url=a.target_url
@@ -127,7 +143,7 @@ class App:
             warnings=coverage_warnings(report)
             if warnings and not task['error']:
                 task.update(error=True,message='Поиск неполный: '+warnings[0])
-        return {'csrf':self.csrf,'jobs':jobs,'history':history,'task':task,'confirmation':confirmation,
+        return {'telegram':self.telegram_status(),'csrf':self.csrf,'jobs':jobs,'broken':broken,'history':history,'task':task,'confirmation':confirmation,
             'logs':logs,'coverage':report,'settings':search_settings.load(self.root/'profile'),
             'sources':sources.load(self.root/'profile'),'preferences':load_preferences(self.root/'profile'),
             'schedule':schedule,'last_scheduled':last_scheduled,'failures':failures,'excluded':excluded,
@@ -143,7 +159,10 @@ class App:
                 try:message=work() or message
                 except CheckError as exc:error=True;message=str(exc)
                 except Exception as exc:
-                    error=True;message='Действие остановлено. Проверьте историю перед повторной отправкой.'
+                    error=True
+                    message=('Действие остановлено. Проверьте историю перед повторной отправкой.' if kind=='hh' else
+                             'Вход не завершён: окно браузера закрыто или HH не ответил. Повторите «Вход в HH».' if kind=='login' else
+                             'Действие остановлено из-за ошибки. Повторите позже.')
                     with self.guard:self.logs.append('Ошибка: '+type(exc).__name__)
                 finally:
                     with self.guard:
@@ -255,8 +274,10 @@ class App:
                         self.task['message']='Войдите в HH в открытом браузере, затем нажмите «Готово» здесь.'
                     if not self.confirm_event.wait(600):return 'Время ожидания входа истекло.'
                     if not self.answer:return 'Вход закрыт.'
-                    check_blocker(page)
-                    return 'Сессия HH сохранена.'
+                    from browser_check import verify_login
+                    if not verify_login(context):
+                        return 'Вход не подтверждён: HH всё ещё просит войти. Нажмите «Вход в HH» ещё раз и войдите полностью.'
+                    return 'Вход в HH проверен и сохранён.'
                 finally:context.close()
         self.start('login',work)
 
@@ -267,7 +288,11 @@ class App:
             self.answer='' if data.get('cancel') else 'done'
             self.confirmation=None;self.confirm_event.set()
 
+    ACTIONS={'confirm','login-done','search','rewrite','retry','prepare','login','view','settings','restore','resolve',
+             'letter','defer','skip','manual-sent'}
+
     def mutate(self,action,data):
+        if action not in self.ACTIONS:raise CheckError('Неизвестное действие.')  # before any key lookup (audit A37)
         if action=='confirm':return self.confirm(data)
         if action=='login-done':return self.login_done(data)
         if action=='search':return self.search()
@@ -290,64 +315,46 @@ class App:
                     if not isinstance(excluded,list) or len(excluded)>50 or not all(isinstance(v,str) and v.strip() for v in excluded):
                         raise CheckError('Укажите исключённые компании отдельными строками.')
                     prefs=load_preferences(self.root/'profile')
+                    if not isinstance(prefs,dict):raise CheckError('Файл profile/preferences.json не найден; настройки не сохранены.')
                     search_settings.save(self.root/'profile',cfg)
                     sources.save(self.root/'profile',config)
                     prefs['excluded_companies']=excluded
                     temp=self.root/'profile/preferences.tmp'
                     temp.write_text(json.dumps(prefs,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
-                    temp.replace(self.root/'profile/preferences.json')
+                    from common import replace_file
+                    replace_file(temp,self.root/'profile/preferences.json')
                     return
                 with self.store() as store:
-                    if action=='restore':
-                        key=str(data.get('key','')).split(':')
-                        if len(key)!=2 or key[0] not in {'hh','web'} or not key[1].isascii() or not key[1].isdigit():raise CheckError('Некорректная вакансия.')
-                        row=store.get(key[1],key[0])
-                        if row is None or row['status']!='skipped':raise CheckError('Вакансия уже восстановлена или недоступна.')
-                        store.connection.executescript(hh_response.SCHEMA)
-                        attempt=store.connection.execute('SELECT state FROM application_attempts WHERE target_url=?',(row['url'],)).fetchone()
-                        if attempt and attempt[0] not in {'hh_prepared','hh_form_closed'}:raise CheckError('Отправка уже начиналась; восстановление не разрешает повторный отклик.')
-                        with store.connection:store.connection.execute("UPDATE jobs SET status='new',status_reason='restored_by_user' WHERE source=? AND vacancy_id=?",key)
-                        work_queue.stage(store,tuple(key),'new')
-                        return
+                    if action=='restore':return actions.restore(self.root,store,data.get('key'))
                     if action=='resolve':
                         # The user checked HH after an unknown result. Exact phrases; never a network action.
-                        store.connection.executescript(hh_response.SCHEMA)
-                        row=store.connection.execute('''SELECT a.state,j.source,j.vacancy_id FROM application_attempts a
-                            LEFT JOIN jobs j ON j.url=a.target_url WHERE a.target_url=?''',(str(data.get('url','')),)).fetchone()
-                        if not row or row[0] not in {'submitted_unverified','submit_started'} or row[1]!='hh':
-                            raise CheckError('Для этой записи отметка результата не требуется.')
-                        outcome={f'ОТКЛИК ЕСТЬ {row[2]}':'reported_by_user',f'ОТКЛИКА НЕТ {row[2]}':'hh_form_closed'}.get(data.get('text'))
+                        _,identity=actions.unresolved_attempt(store,data.get('url'))
+                        outcome={f'ОТКЛИК ЕСТЬ {identity}':'delivered',f'ОТКЛИКА НЕТ {identity}':'not_sent'}.get(data.get('text'))
                         if not outcome:raise CheckError('Введите фразу точно как показано.')
-                        with store.connection:
-                            store.connection.execute('UPDATE application_attempts SET state=?,updated_at=? WHERE target_url=?',(outcome,stamp(),data['url']))
-                            if outcome=='reported_by_user':
-                                store.connection.execute("UPDATE jobs SET status='applied' WHERE source='hh' AND vacancy_id=?",(row[2],))
-                        return
+                        return actions.resolve_attempt(self.root,store,data['url'],outcome)
                     path,packet=self.packet(store,data.get('key'))
-                    if action=='letter':
-                        text=data.get('text')
-                        if not isinstance(text,str) or not text.strip() or len(text)>12000:raise CheckError('Письмо должно содержать от 1 до 12 000 символов.')
-                        letter=Path(packet['letter_path']);temp=letter.with_suffix('.tmp')
-                        temp.write_text(text,encoding='utf-8');temp.replace(letter)
-                        draft_queue.mark_reviewed(store.connection,path,packet)
-                    elif action=='defer':draft_queue.mark_reviewed(store.connection,path,packet)
-                    elif action=='skip':
-                        with store.connection:store.connection.execute("UPDATE jobs SET status='skipped',status_reason='user' WHERE source=? AND vacancy_id=?",(packet['source'],packet['vacancy_id']))
+                    key=data.get('key')
+                    if action=='letter':actions.save_letter(self.root,store,key,data.get('text'))
+                    elif action=='defer':actions.defer(self.root,store,key)
+                    elif action=='skip':actions.skip(self.root,store,key)
                     elif action=='manual-sent':
-                        if packet['source']=='hh' or data.get('text')!=f"ОТПРАВЛЕНО {packet['vacancy_id']}":raise CheckError('Нужно точное подтверждение ручной отправки для внешней вакансии.')
-                        store.connection.executescript(hh_response.SCHEMA)
-                        with store.connection:
-                            store.connection.execute('INSERT INTO application_attempts VALUES (?,?,?,?) ON CONFLICT(target_url) DO NOTHING',
-                                (packet['url'],'manual-user-confirmation','reported_by_user',stamp()))
-                            store.connection.execute("UPDATE jobs SET status='applied' WHERE source=? AND vacancy_id=?",(packet['source'],packet['vacancy_id']))
+                        if data.get('text')!=f"ОТПРАВЛЕНО {packet['vacancy_id']}":raise CheckError('Нужно точное подтверждение ручной отправки.')
+                        actions.manual_sent(self.root,store,key)
                     else:raise CheckError('Неизвестное действие.')
 
 
 class Server(ThreadingHTTPServer):
     daemon_threads=True
+    allow_reuse_address=False  # on Windows SO_REUSEADDR lets a second copy bind the same port (audit A24)
+
     def __init__(self,address,app):
         super().__init__(address,Handler)
         self.app=app
+
+    def server_bind(self):
+        import socket
+        if hasattr(socket,'SO_EXCLUSIVEADDRUSE'):self.socket.setsockopt(socket.SOL_SOCKET,socket.SO_EXCLUSIVEADDRUSE,1)
+        super().server_bind()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -355,6 +362,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def reply(self,code,body,kind='application/json; charset=utf-8'):
         if not isinstance(body,bytes):body=json.dumps(body,ensure_ascii=False).encode('utf-8')
+        try:self._send(code,body,kind)
+        except (ConnectionAbortedError,ConnectionResetError,BrokenPipeError):pass  # the tab closed first (audit A23)
+
+    def _send(self,code,body,kind):
         self.send_response(code)
         for key,value in {'Content-Type':kind,'Content-Length':str(len(body)),'Cache-Control':'no-store',
             'X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer',
@@ -383,7 +394,8 @@ class Handler(BaseHTTPRequestHandler):
         # Windows may reset the socket before the client receives the error.
         try:length=int(self.headers.get('Content-Length','0'))
         except ValueError:return self.reply(400,{'error':'Некорректная длина запроса.'})
-        if not 0<length<=131072:return self.reply(413,{'error':'Слишком большой запрос.'})
+        if length<=0:return self.reply(400,{'error':'Пустой запрос.'})
+        if length>131072:return self.reply(413,{'error':'Слишком большой запрос.'})
         raw=self.rfile.read(length)
         if not self.origin_ok() or not secrets.compare_digest(self.headers.get('X-Hunter-Token',''),self.server.app.csrf):
             return self.reply(403,{'error':'Обновите страницу приложения.'})
@@ -399,7 +411,8 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(200,{'ok':True})
         except CheckError as exc:self.reply(409,{'error':str(exc)})
         except (ValueError,KeyError,TypeError):self.reply(400,{'error':'Проверьте введённые значения.'})
-        except Exception:self.reply(500,{'error':'Действие остановлено. Данные сохранены; обновите страницу.'})
+        except OSError:self.reply(409,{'error':'Изменение НЕ сохранено: файл занят другой программой. Повторите через несколько секунд.'})
+        except Exception:self.reply(500,{'error':'Действие остановлено из-за ошибки программы. Обновите страницу и проверьте, сохранилось ли изменение.'})
 
 
 def main():

@@ -48,7 +48,13 @@ def main():
                    'started_at':datetime.now(timezone.utc).isoformat()}
             hunt.save_report(state,STATE)
             hunt.save_report({'state':'running','slot':slot},ROOT/'data/schedule_waiting.json')
-            code=hunt.main(['--run','--queue'])
+            try:code=hunt.main(['--run','--queue'])
+            except SystemExit as exc:
+                code=exc.code if isinstance(exc.code,int) else 1
+                state.update(state='stopped',exit_code=code,finished_at=datetime.now(timezone.utc).isoformat(),
+                    error='Запуск остановлен до начала работы: неверные настройки поиска (profile/search_settings.json). '
+                          'Откройте настройки на сайте программы и сохраните их заново.')
+                hunt.save_report(state,STATE);return code
             report=json.loads(hunt.LAST.read_text(encoding='utf-8'))
             state.update(state=report['state'],exit_code=code,run_id=report.get('run_id'),
                          report_path=report.get('report_path',str(hunt.LAST)),

@@ -12,7 +12,18 @@ from urllib.parse import urljoin, urlsplit, parse_qs
 
 from common import CheckError
 from browser_check import PROFILE_DIR, navigate, check_blocker, already_applied, read_job_snapshot, job_content_hash
-from apply import SCHEMA, now
+from datetime import datetime, timezone
+
+# Moved from an archived site-form pilot (audit A38); the table and its rows are unchanged.
+SCHEMA = """CREATE TABLE IF NOT EXISTS application_attempts (
+    target_url TEXT PRIMARY KEY, packet_hash TEXT NOT NULL,
+    state TEXT NOT NULL, updated_at TEXT NOT NULL
+);"""
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
 
 SUBMIT = '[data-qa="vacancy-response-submit-popup"]'
 LETTER = '[data-qa="vacancy-response-popup-form-letter-input"]'
@@ -161,6 +172,14 @@ def run(packet, db, *, allow_send=False, prompt=input, profile_dir=PROFILE_DIR, 
                       'vacancy_url':packet['url'], 'state':'hh_prepared', 'prepared_at':now()}
             (output/'form-review.json').write_text(json.dumps(review,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
             page.screenshot(path=str(output/'form-filled.png'),full_page=True)
+            # A compact picture of just the form for the phone (Telegram); the full page stays for the record.
+            try:
+                # Show the whole letter on the picture, not only the textarea's visible lines.
+                try:page.locator(LETTER).evaluate("e=>{e.style.height=e.scrollHeight+'px'}")
+                except Exception:pass
+                page.locator(SUBMIT).locator('xpath=ancestor::form[1]').screenshot(path=str(output/'form-view.png'))
+                review['form_image']=str(output/'form-view.png')
+            except Exception:review['form_image']=str(output/'form-filled.png')
             print(f"Форма заполнена: {packet['title']} | {packet['company']}\nРезюме в HH: {title}")
             print(f"Локальная рекомендация: {Path(packet['local_cv_path']).name}. Файл в HH не загружался.")
             print(f"Проверьте содержание резюме HH и письмо. Скриншот: {output/'form-filled.png'}")
@@ -183,7 +202,7 @@ def run(packet, db, *, allow_send=False, prompt=input, profile_dir=PROFILE_DIR, 
             response_url(page.url,page.url,packet['vacancy_id'])
             if page.locator(LETTER).input_value() != Path(packet['letter_path']).read_text(encoding='utf-8'):
                 raise CheckError('Письмо в форме изменилось; повторите просмотр до отправки.')
-            if title not in page.locator('[data-qa="resume-title"]').all_inner_texts():
+            if title not in [t.strip() for t in page.locator('[data-qa="resume-title"]').all_inner_texts()]:
                 raise CheckError('Резюме HH изменилось после просмотра; отправка отменена.')
             begin_submit(db,packet,fingerprint)
             page.locator(SUBMIT).click(timeout=10000)
@@ -208,11 +227,12 @@ def run(packet, db, *, allow_send=False, prompt=input, profile_dir=PROFILE_DIR, 
             if state!='confirmed_by_site' and any(success.nth(i).is_visible() for i in range(success.count())):
                 state='confirmed_by_site'
             set_state(db,packet['url'],state)
-            page.screenshot(path=str(output/'after-submit.png'),full_page=True)
             if state=='confirmed_by_site':
                 with db:
                     db.execute("UPDATE jobs SET status='applied' WHERE source='hh' AND vacancy_id=?",(packet['vacancy_id'],))
-            else:
+            try:page.screenshot(path=str(output/'after-submit.png'),full_page=True)
+            except Exception:pass  # the record above is what matters; a closed window must not hide it
+            if state!='confirmed_by_site':
                 print('Подтверждение сайта не найдено. Проверьте страницу, повторная отправка заблокирована.')
             return state
         except AlreadyApplied as exc:
@@ -222,8 +242,10 @@ def run(packet, db, *, allow_send=False, prompt=input, profile_dir=PROFILE_DIR, 
             print(str(exc))
             return 'already_applied_on_hh'
         except Exception:
-            if 'page' in locals() and not page.is_closed():
-                page.screenshot(path=str(output/'form-stopped.png'),full_page=True)
+            try:
+                if 'page' in locals() and not page.is_closed():
+                    page.screenshot(path=str(output/'form-stopped.png'),full_page=True)
+            except Exception:pass  # never replace the real error with a screenshot error
             raise
         finally:
             context.close()
