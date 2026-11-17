@@ -8,6 +8,7 @@ from unittest.mock import Mock,patch
 import requests
 
 from common import CheckError
+from model_stub import setUpModule, tearDownModule  # noqa: F401
 import draft_queue
 import letter_rewrite
 import search_settings

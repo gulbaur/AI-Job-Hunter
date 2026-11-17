@@ -10,6 +10,7 @@ from unittest.mock import Mock,patch
 import requests
 
 from common import CheckError
+from model_stub import setUpModule, tearDownModule  # noqa: F401
 import personalized
 import web_search
 import company_research
@@ -117,8 +118,14 @@ class AutonomyTests(unittest.TestCase):
         import model_api
         session=Mock();session.post.return_value=error_response(402,'Insufficient credits')
         with self.assertRaises(model_api.ModelUnavailable) as caught:
-            model_api.request_json(session,{},'fixture',lambda raw:raw)
+            model_api.request_json(session,{'model':'test/model'},'fixture',lambda raw:raw)
         self.assertIn('HTTP 402',str(caught.exception));self.assertIn('Insufficient credits',str(caught.exception))
+
+    def test_missing_model_id_is_reported_before_any_paid_request(self):
+        import model_api
+        session=Mock()
+        with self.assertRaises(CheckError) as caught:model_api.request_json(session,{'model':' '},'fixture',lambda raw:raw)
+        self.assertIn('OPENROUTER_MODEL',str(caught.exception));session.post.assert_not_called()
 
     def test_web_refresh_stops_series_after_configuration_error(self):
         session=Mock();session.post.return_value=error_response(404,'No endpoints found')

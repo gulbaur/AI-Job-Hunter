@@ -14,6 +14,7 @@ import requests
 
 import assess
 from common import CheckError
+from model_stub import setUpModule, tearDownModule  # noqa: F401
 from storage import JobStore
 
 PROFILES = {"ml_engineer": "Evaluated image classification models with PyTorch.",

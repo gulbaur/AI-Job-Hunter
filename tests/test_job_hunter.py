@@ -357,6 +357,17 @@ class JobHunterTests(unittest.TestCase):
                     with self.assertRaises(hh.CheckError):check_setup.check_hh()
         self.assertIn("браузер", self.output.getvalue())
 
+    def test_openrouter_check_requires_the_model_ids_in_env(self):
+        key_info = response({"data": {"limit": None}})
+        with patch.dict(os.environ, {"OPENROUTER_MODEL": "", "OPENROUTER_AUDIT_MODEL": ""}), \
+             patch.object(requests.Session, "get", return_value=key_info), contextlib.redirect_stdout(self.output):
+            with self.assertRaises(hh.CheckError) as error:
+                check_setup.check_openrouter()
+        self.assertIn("OPENROUTER_MODEL", str(error.exception))
+        with patch.dict(os.environ, {"OPENROUTER_MODEL": "a/b", "OPENROUTER_AUDIT_MODEL": "c/d"}), \
+             patch.object(requests.Session, "get", return_value=key_info), contextlib.redirect_stdout(self.output):
+            self.assertEqual(check_setup.check_openrouter(), "OK")
+
     def test_existing_hh_and_sqlite_checks_reuse_client_without_openrouter(self):
         def fake_get(session, url, **kwargs):
             self.transport(session, url, kwargs)

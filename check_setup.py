@@ -121,6 +121,9 @@ def check_openrouter() -> str:
         print(f"Доступный остаток лимита ключа: {format_usd(data['limit_remaining'])}.")
     elif data.get("limit") is not None:
         print("API не сообщил доступный остаток лимита ключа.")
+    missing = [name for name in ("OPENROUTER_MODEL", "OPENROUTER_AUDIT_MODEL") if not os.getenv(name, "").strip()]
+    if missing:
+        raise CheckError("Не указаны модели OpenRouter в .env: " + ", ".join(missing) + ".")
     return "OK"
 
 

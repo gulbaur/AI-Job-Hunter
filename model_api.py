@@ -20,6 +20,8 @@ class ModelUnavailable(CheckError):
 
 
 def request_json(session, payload: dict, key: str, validator) -> tuple[dict, dict]:
+    if not str(payload.get("model") or "").strip():
+        raise CheckError("Модель не указана: задайте OPENROUTER_MODEL и OPENROUTER_AUDIT_MODEL в .env.")
     try:
         response = session.post("https://openrouter.ai/api/v1/chat/completions",
                                 headers={"Authorization": f"Bearer {key}"}, json=payload,
