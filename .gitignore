@@ -37,3 +37,6 @@ __pycache__/
 /ml-path/
 *.zip
 *.lock
+
+# Local tools and working notes
+/local/
